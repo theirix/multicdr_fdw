@@ -25,7 +25,7 @@ PG_MODULE_MAGIC;
 /*
  * Describes the valid options for objects that use this wrapper.
  */
-struct FileFdwOption
+struct MultiCdrFdwOption
 {
 	const char *optname;
 	Oid			optcontext;		/* Oid of catalog in which option may appear */
@@ -38,9 +38,11 @@ struct FileFdwOption
  * Note: If you are adding new option for user mapping, you need to modify
  * fileGetOptions(), which currently doesn't bother to look at user mappings.
  */
-static struct FileFdwOption valid_options[] = {
+static struct MultiCdrFdwOption valid_options[] = {
 	/* File options */
-	{"filename", ForeignTableRelationId},
+	{"directory", ForeignTableRelationId},
+	{"pattern", ForeignTableRelationId},
+	{"cdrfields", ForeignTableRelationId},
 
 	/* Format options */
 	/* oids option is not supported */
@@ -69,12 +71,14 @@ static struct FileFdwOption valid_options[] = {
 /*
  * FDW-specific information for ForeignScanState.fdw_state.
  */
-typedef struct FileFdwExecutionState
+typedef struct MultiCdrExecutionState
 {
-	char	   *filename;		/* file to read */
-	List	   *options;		/* merged COPY options, excluding filename */
+	char	   *directory;		/* directory to read */
+	char	   *pattern;			/* filename pattern */
+	char	   *cdrfields;		/* raw cdr fields mapping */
+	List	   *options;		/* merged COPY options, excluding custom options */
 	CopyState	cstate;			/* state of reading file */
-} FileFdwExecutionState;
+} MultiCdrExecutionState;
 
 /*
  * SQL functions
@@ -101,11 +105,10 @@ static void fileEndForeignScan(ForeignScanState *node);
  * Helper functions
  */
 static bool is_valid_option(const char *option, Oid context);
-static void fileGetOptions(Oid foreigntableid,
-			   char **filename, List **other_options);
+static void fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state);
 static void estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
-			   const char *filename,
-			   Cost *startup_cost, Cost *total_cost);
+				MultiCdrExecutionState *state,
+				Cost *startup_cost, Cost *total_cost);
 
 
 /*
@@ -138,7 +141,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid			catalog = PG_GETARG_OID(1);
-	char	   *filename = NULL;
+	char *directory, *pattern, *cdrfields;
 	List	   *other_options = NIL;
 	ListCell   *cell;
 
@@ -170,7 +173,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 
 		if (!is_valid_option(def->defname, catalog))
 		{
-			struct FileFdwOption *opt;
+			struct MultiCdrFdwOption *opt;
 			StringInfoData buf;
 
 			/*
@@ -192,14 +195,30 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 							 buf.data)));
 		}
 
-		/* Separate out filename, since ProcessCopyOptions won't allow it */
-		if (strcmp(def->defname, "filename") == 0)
+		/* Separate out own options, since ProcessCopyOptions won't allow it */
+		if (strcmp(def->defname, "directory") == 0)
 		{
-			if (filename)
+			if (directory)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("conflicting or redundant options")));
-			filename = defGetString(def);
+			directory = defGetString(def);
+		}
+		else if (strcmp(def->defname, "pattern") == 0)
+		{
+			if (pattern)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			pattern = defGetString(def);
+		}
+		else if (strcmp(def->defname, "cdrfields") == 0)
+		{
+			if (cdrfields)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			cdrfields = defGetString(def);
 		}
 		else
 			other_options = lappend(other_options, def);
@@ -211,12 +230,20 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 	ProcessCopyOptions(NULL, true, other_options);
 
 	/*
-	 * Filename option is required for multicdr_fdw foreign tables.
+	 * Options that are required for multicdr_fdw foreign tables.
 	 */
-	if (catalog == ForeignTableRelationId && filename == NULL)
+	if (catalog == ForeignTableRelationId && directory == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-				 errmsg("filename is required for multicdr_fdw foreign tables")));
+				 errmsg("directory is required for multicdr_fdw foreign tables")));
+	if (catalog == ForeignTableRelationId && pattern == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+				 errmsg("pattern is required for multicdr_fdw foreign tables")));
+	if (catalog == ForeignTableRelationId && cdrfields == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+				 errmsg("cdrfields is required for multicdr_fdw foreign tables")));
 
 	PG_RETURN_VOID();
 }
@@ -228,7 +255,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 static bool
 is_valid_option(const char *option, Oid context)
 {
-	struct FileFdwOption *opt;
+	struct MultiCdrFdwOption *opt;
 
 	for (opt = valid_options; opt->optname; opt++)
 	{
@@ -245,15 +272,13 @@ is_valid_option(const char *option, Oid context)
  * it must not appear in the options list passed to the core COPY code.
  */
 static void
-fileGetOptions(Oid foreigntableid,
-			   char **filename, List **other_options)
+fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 {
 	ForeignTable *table;
 	ForeignServer *server;
 	ForeignDataWrapper *wrapper;
-	List	   *options;
-	ListCell   *lc,
-			   *prev;
+	List	   *options, *new_options;
+	ListCell   *lc;
 
 	/*
 	 * Extract options from FDW objects.  We ignore user mappings because
@@ -273,31 +298,42 @@ fileGetOptions(Oid foreigntableid,
 	options = list_concat(options, table->options);
 
 	/*
-	 * Separate out the filename.
+	 * Read options
 	 */
-	*filename = NULL;
-	prev = NULL;
+	state->directory = state->pattern = state->cdrfields = NULL;
+	new_options = NIL;
 	foreach(lc, options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
 
-		if (strcmp(def->defname, "filename") == 0)
+		if (strcmp(def->defname, "directory") == 0)
 		{
-			*filename = defGetString(def);
-			options = list_delete_cell(options, lc, prev);
-			break;
+			state->directory = defGetString(def);
 		}
-		prev = lc;
+		else if (strcmp(def->defname, "pattern") == 0)
+		{
+			state->pattern = defGetString(def);
+		}
+		else if (strcmp(def->defname, "cdrfields") == 0)
+		{
+			state->cdrfields = defGetString(def);
+		}
+		else
+			new_options = lappend(new_options, def);
 	}
 
 	/*
-	 * The validator should have checked that a filename was included in the
+	 * The validator should have checked that all options are included in the
 	 * options, but check again, just in case.
 	 */
-	if (*filename == NULL)
-		elog(ERROR, "filename is required for multicdr_fdw foreign tables");
+	if (state->directory == NULL)
+		elog(ERROR, "directory is required for multicdr_fdw foreign tables");
+	if (state->pattern == NULL)
+		elog(ERROR, "pattern is required for multicdr_fdw foreign tables");
+	if (state->cdrfields == NULL)
+		elog(ERROR, "cdrfields is required for multicdr_fdw foreign tables");
 
-	*other_options = options;
+	state->options = new_options;
 }
 
 /*
@@ -310,15 +346,14 @@ filePlanForeignScan(Oid foreigntableid,
 					RelOptInfo *baserel)
 {
 	FdwPlan    *fdwplan;
-	char	   *filename;
-	List	   *options;
+	MultiCdrExecutionState state;
 
-	/* Fetch options --- we only need filename at this point */
-	fileGetOptions(foreigntableid, &filename, &options);
+	/* Fetch options */
+	fileGetOptions(foreigntableid, &state);
 
 	/* Construct FdwPlan with cost estimates */
 	fdwplan = makeNode(FdwPlan);
-	estimate_costs(root, baserel, filename,
+	estimate_costs(root, baserel, &state,
 				   &fdwplan->startup_cost, &fdwplan->total_cost);
 	fdwplan->fdw_private = NIL; /* not used */
 
@@ -332,23 +367,18 @@ filePlanForeignScan(Oid foreigntableid,
 static void
 fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
-	char	   *filename;
-	List	   *options;
+	MultiCdrExecutionState state;
 
-	/* Fetch options --- we only need filename at this point */
-	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
-				   &filename, &options);
+	/* Fetch options */
+	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &state);
 
-	ExplainPropertyText("Foreign File", filename, es);
+	ExplainPropertyText("Foreign Directory", state.directory, es);
+	ExplainPropertyText("Foreign Pattern", state.pattern, es);
+	ExplainPropertyText("Foreign CDR Fields", state.cdrfields, es);
 
 	/* Suppress file size if we're not showing cost details */
 	if (es->costs)
 	{
-		struct stat stat_buf;
-
-		if (stat(filename, &stat_buf) == 0)
-			ExplainPropertyLong("Foreign File Size", (long) stat_buf.st_size,
-								es);
 	}
 }
 
@@ -359,10 +389,9 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 static void
 fileBeginForeignScan(ForeignScanState *node, int eflags)
 {
-	char	   *filename;
-	List	   *options;
 	CopyState	cstate;
-	FileFdwExecutionState *festate;
+	MultiCdrExecutionState *festate;
+	char *filename_fake = NULL;
 
 	/*
 	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
@@ -370,26 +399,23 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
+	festate = (MultiCdrExecutionState *) palloc(sizeof(MultiCdrExecutionState));
 	/* Fetch options of foreign table */
-	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
-				   &filename, &options);
+	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), festate);
 
 	/*
 	 * Create CopyState from FDW options.  We always acquire all columns, so
 	 * as to match the expected ScanTupleSlot signature.
 	 */
 	cstate = BeginCopyFrom(node->ss.ss_currentRelation,
-						   filename,
+						   filename_fake,
 						   NIL,
-						   options);
+						   festate->options);
 
 	/*
 	 * Save state in node->fdw_state.  We must save enough information to call
 	 * BeginCopyFrom() again.
 	 */
-	festate = (FileFdwExecutionState *) palloc(sizeof(FileFdwExecutionState));
-	festate->filename = filename;
-	festate->options = options;
 	festate->cstate = cstate;
 
 	node->fdw_state = (void *) festate;
@@ -403,7 +429,7 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 static TupleTableSlot *
 fileIterateForeignScan(ForeignScanState *node)
 {
-	FileFdwExecutionState *festate = (FileFdwExecutionState *) node->fdw_state;
+	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	bool		found;
 	ErrorContextCallback errcontext;
@@ -446,7 +472,7 @@ fileIterateForeignScan(ForeignScanState *node)
 static void
 fileEndForeignScan(ForeignScanState *node)
 {
-	FileFdwExecutionState *festate = (FileFdwExecutionState *) node->fdw_state;
+	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
 
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
 	if (festate)
@@ -460,12 +486,13 @@ fileEndForeignScan(ForeignScanState *node)
 static void
 fileReScanForeignScan(ForeignScanState *node)
 {
-	FileFdwExecutionState *festate = (FileFdwExecutionState *) node->fdw_state;
+	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
+	char *filename_fake = NULL;
 
 	EndCopyFrom(festate->cstate);
 
 	festate->cstate = BeginCopyFrom(node->ss.ss_currentRelation,
-									festate->filename,
+									filename_fake,
 									NIL,
 									festate->options);
 }
@@ -475,8 +502,8 @@ fileReScanForeignScan(ForeignScanState *node)
  */
 static void
 estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
-			   const char *filename,
-			   Cost *startup_cost, Cost *total_cost)
+		MultiCdrExecutionState *state,
+		Cost *startup_cost, Cost *total_cost)
 {
 	struct stat stat_buf;
 	BlockNumber pages;
@@ -486,6 +513,7 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 	Cost		run_cost = 0;
 	Cost		cpu_per_tuple;
 
+#if 0
 	/*
 	 * Get size of the file.  It might not be there at plan time, though, in
 	 * which case we have to use a default estimate.
@@ -540,4 +568,9 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 	cpu_per_tuple = cpu_tuple_cost * 10 + baserel->baserestrictcost.per_tuple;
 	run_cost += cpu_per_tuple * ntuples;
 	*total_cost = *startup_cost + run_cost;
+#endif
+
+	*startup_cost = baserel->baserestrictcost.startup;
+	*total_cost = *startup_cost * 10;
+	baserel->rows = 10;
 }
