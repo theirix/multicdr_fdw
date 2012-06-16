@@ -9,6 +9,7 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_table.h"
@@ -73,12 +74,23 @@ static struct MultiCdrFdwOption valid_options[] = {
  */
 typedef struct MultiCdrExecutionState
 {
-	char	   *directory;		/* directory to read */
-	char	   *pattern;			/* filename pattern */
-	char	   *cdrfields;		/* raw cdr fields mapping */
-	List	   *options;		/* merged COPY options, excluding custom options */
+	char		*directory;		/* directory to read */
+	char		*pattern;			/* filename pattern */
+	char		*cdrfields;		/* raw cdr fields mapping */
+	List		*options;		/* merged COPY options, excluding custom options */
 	CopyState	cstate;			/* state of reading file */
+	
+	/* context */
+	char           *read_buf;
+	Datum          *text_array_values;
+	bool           *text_array_nulls;
+	int             recnum;
+
+	List			*files;
+	ListCell	*currentFile;
 } MultiCdrExecutionState;
+
+#define FILE_FDW_TEXTARRAY_STASH_INIT 64
 
 /*
  * SQL functions
@@ -141,7 +153,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid			catalog = PG_GETARG_OID(1);
-	char *directory, *pattern, *cdrfields;
+	char *directory = NULL, *pattern = NULL, *cdrfields = NULL;
 	List	   *other_options = NIL;
 	ListCell   *cell;
 
@@ -297,6 +309,8 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	options = list_concat(options, server->options);
 	options = list_concat(options, table->options);
 
+	state->files = NIL;
+
 	/*
 	 * Read options
 	 */
@@ -382,6 +396,109 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	}
 }
 
+static int
+enumerateFiles (MultiCdrExecutionState *state)
+{
+	DIR *dir;
+	struct dirent *de;
+	struct stat file_stat;
+	const int buf_size = 4096;
+	char full_name[buf_size];
+	int status;
+
+	state->files = NIL;
+	state->currentFile = NIL;
+
+	dir = opendir( state->directory );
+
+	if (!dir)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_DATA_FOUND),
+				 errmsg("no directory found %s", dir)));
+		return -1;
+	}
+
+	while ((de = readdir( dir )) != NULL)
+	{
+		strncpy( full_name, state->directory, sizeof(full_name)-1 );
+		strncat( full_name, "/", sizeof(full_name)-1 );
+		strncat( full_name, de->d_name, sizeof(full_name)-1 );
+		
+		if (stat( full_name, &file_stat ))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_NO_DATA_FOUND),
+					 errmsg("can't retrieve file information %s", full_name)));
+			closedir( dir );
+			return -1;
+		}
+		if ((file_stat.st_mode & S_IFREG) != 0)
+		{
+			state->files = lappend(state->files, strdup(full_name));
+		}
+	}
+	state->currentFile = (char*)lfirst(list_head(state->files));
+
+	closedir( dir );
+	return 0;
+}
+
+static void
+beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
+{
+	char *filename;
+	ListCell *cell;
+
+	enumerateFiles( festate );
+
+	foreach (cell, festate->files)
+	{
+		filename = (char*) lfirst(cell);
+		elog(NOTICE, "found file: %s", filename);
+	}
+	elog(NOTICE, "current file: %s", festate->currentFile);
+
+	festate->cstate = NULL;
+	if (festate->currentFile)
+	{
+		/* Create CopyState from FDW options.  We always acquire all columns, so
+		 * as to match the expected ScanTupleSlot signature.
+		 */
+		festate->cstate = BeginCopyFrom(node->ss.ss_currentRelation,
+								 festate->currentFile,
+								 NIL,
+								 festate->options);
+
+		/* set up the work area we'll use to construct the array */
+		festate->text_array_stash_size = FILE_FDW_TEXTARRAY_STASH_INIT;
+		festate->text_array_values =
+			palloc(FILE_FDW_TEXTARRAY_STASH_INIT * sizeof(Datum));
+		festate->text_array_nulls =
+			palloc(FILE_FDW_TEXTARRAY_STASH_INIT * sizeof(bool));
+	}
+}
+
+static void
+endScan(MultiCdrExecutionState *festate)
+{
+	/* if festate is NULL, we are in EXPLAIN; nothing to do */
+	if (festate)
+	{
+		if (festate->cstate)
+		{
+			EndCopyFrom(festate->cstate);
+			festate->cstate = NULL;
+		}
+
+		if (festate->files)
+		{
+			list_free(festate->files);
+			festate->files = NIL;
+		}
+	}
+}
+
 /*
  * fileBeginForeignScan
  *		Initiate access to the file by creating CopyState
@@ -389,9 +506,7 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 static void
 fileBeginForeignScan(ForeignScanState *node, int eflags)
 {
-	CopyState	cstate;
 	MultiCdrExecutionState *festate;
-	char *filename_fake = NULL;
 
 	/*
 	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
@@ -404,22 +519,119 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), festate);
 
 	/*
-	 * Create CopyState from FDW options.  We always acquire all columns, so
-	 * as to match the expected ScanTupleSlot signature.
-	 */
-	cstate = BeginCopyFrom(node->ss.ss_currentRelation,
-						   filename_fake,
-						   NIL,
-						   festate->options);
-
-	/*
 	 * Save state in node->fdw_state.  We must save enough information to call
 	 * BeginCopyFrom() again.
 	 */
-	festate->cstate = cstate;
-
 	node->fdw_state = (void *) festate;
+
+	beginScan( festate, node );
 }
+
+#if 0
+bool
+MyNextCopyFrom(CopyState cstate, ExprContext *econtext,
+			 Datum *values, bool *nulls, Oid *tupleOid)
+{
+	TupleDesc	tupDesc;
+	Form_pg_attribute *attr;
+	AttrNumber	num_phys_attrs,
+				attr_count,
+				num_defaults = cstate->num_defaults;
+	FmgrInfo   *in_functions = cstate->in_functions;
+	Oid		   *typioparams = cstate->typioparams;
+	int			i;
+	int			nfields;
+	bool		isnull;
+	bool		file_has_oids = cstate->file_has_oids;
+	int		   *defmap = cstate->defmap;
+	ExprState **defexprs = cstate->defexprs;
+
+	tupDesc = RelationGetDescr(cstate->rel);
+	attr = tupDesc->attrs;
+	num_phys_attrs = tupDesc->natts;
+	attr_count = list_length(cstate->attnumlist);
+	nfields = file_has_oids ? (attr_count + 1) : attr_count;
+
+	/* Initialize all values for row to NULL */
+	MemSet(values, 0, num_phys_attrs * sizeof(Datum));
+	MemSet(nulls, true, num_phys_attrs * sizeof(bool));
+
+	if (!cstate->binary)
+	{
+		char	  **field_strings;
+		ListCell   *cur;
+		int			fldct;
+		int			fieldno;
+		char	   *string;
+
+		/* read raw fields in the next line */
+		if (!NextCopyFromRawFields(cstate, &field_strings, &fldct))
+			return false;
+
+		/* check for overflowing fields */
+		if (nfields > 0 && fldct > nfields)
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+					 errmsg("extra data after last expected column")));
+
+		fieldno = 0;
+
+		/* Loop to read the user attributes on the line. */
+		foreach(cur, cstate->attnumlist)
+		{
+			int			attnum = lfirst_int(cur);
+			int			m = attnum - 1;
+
+			if (fieldno >= fldct)
+				ereport(ERROR,
+						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+						 errmsg("missing data for column \"%s\"",
+								NameStr(attr[m]->attname))));
+			string = field_strings[fieldno++];
+
+			if (cstate->csv_mode && string == NULL &&
+				cstate->force_notnull_flags[m])
+			{
+				/* Go ahead and read the NULL string */
+				string = cstate->null_print;
+			}
+
+			cstate->cur_attname = NameStr(attr[m]->attname);
+			cstate->cur_attval = string;
+			values[m] = InputFunctionCall(&in_functions[m],
+										  string,
+										  typioparams[m],
+										  attr[m]->atttypmod);
+			if (string != NULL)
+				nulls[m] = false;
+			cstate->cur_attname = NULL;
+			cstate->cur_attval = NULL;
+		}
+
+		Assert(fieldno == nfields);
+	}
+
+	/*
+	 * Now compute and insert any defaults available for the columns not
+	 * provided by the input data.	Anything not processed here or above will
+	 * remain NULL.
+	 */
+	for (i = 0; i < num_defaults; i++)
+	{
+		/*
+		 * The caller must supply econtext and have switched into the
+		 * per-tuple memory context in it.
+		 */
+		Assert(econtext != NULL);
+		Assert(CurrentMemoryContext == econtext->ecxt_per_tuple_memory);
+
+		values[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
+										 &nulls[defmap[i]], NULL);
+	}
+
+	return true;
+}
+#endif
 
 /*
  * fileIterateForeignScan
@@ -432,6 +644,8 @@ fileIterateForeignScan(ForeignScanState *node)
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	bool		found;
+	char          **raw_fields;
+	int             nfields;
 	ErrorContextCallback errcontext;
 
 	/* Set up callback to identify error line number. */
@@ -453,17 +667,117 @@ fileIterateForeignScan(ForeignScanState *node)
 	 * foreign tables.
 	 */
 	ExecClearTuple(slot);
-	found = NextCopyFrom(festate->cstate, NULL,
-						 slot->tts_values, slot->tts_isnull,
-						 NULL);
+	found = NextCopyFromRawFields(festate->cstate, &raw_fields, &nfields);
 	if (found)
+	{
+		makeTextArray(festate, slot, raw_fields, nfields);
 		ExecStoreVirtualTuple(slot);
+	}
+
+	/*if (found)
+	{
+		elog(NOTICE, "tuple found 0: %s; %d", DatumGetCString(slot->tts_values+0), slot->tts_isnull[0]);
+		elog(NOTICE, "tuple found 1: %s; %d", DatumGetCString(slot->tts_values+1), slot->tts_isnull[1]);
+	}
+	else
+		elog(NOTICE, "tuple not found");*/
+
 
 	/* Remove error callback. */
 	error_context_stack = errcontext.previous;
 
 	return slot;
 }
+
+static bool
+NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate)
+{
+	int nread;
+
+	nread = read(festate->source, festate->read_buf, festate->read_len);
+	if (nread == 0)
+		return false;
+	else if (nread != festate->read_len)
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_STRING_LENGTH_OR_BUFFER_LENGTH),
+				 errmsg("error reading fixed length record")));
+
+	return true;
+}
+
+/*
+ * Construct the text array from the read in data, and stash it in the slot 
+ */ 
+static void 
+makeTextArray(FileFixedLengthFdwExecutionState *festate, TupleTableSlot *slot)
+{
+	Datum     *values;
+	bool      *nulls;
+	int        dims[1];
+	int        lbs[1];
+	int        fld;
+	Datum      result;
+	int        fldct = festate->nfields;
+	char      *string = festate->read_buf;
+	values = festate->text_array_values;
+	nulls = festate->text_array_nulls;
+
+	dims[0] = fldct;
+	lbs[0] = 1; /* sql arrays typically start at 1 */
+
+	for (fld=0; fld < fldct; fld++)
+	{
+		char *start = string;
+		char *conv;
+		int  len = festate->field_lengths[fld];
+		int  slen = len, i;
+
+		if (festate->trim_all_fields)
+		{
+			/* skip leading and trailing spaces if required */
+			for (i = 0; i < slen && *start == ' '; i++)
+			{
+					start++;
+					len--;
+			}
+			while(len > 0 && start[len-1] == ' ')
+				len--;
+		}
+
+		/*
+		 * pg_any_to_server will both validate that the input is
+		 * ok in the named encoding and translate it from that into the
+		 * current server encoding.
+		 *
+		 * If the string handed back is what we passed in it won't
+		 * be null terminated, but if we get back something else
+		 * it will be (but the length will be unknown);
+		 */
+		conv = pg_any_to_server(start, len, festate->encoding);
+		if (conv == start)
+			values[fld] = PointerGetDatum(cstring_to_text_with_len(conv,len));
+		else
+			values[fld] = PointerGetDatum(cstring_to_text(conv));
+
+		string += festate->field_lengths[fld];
+	}
+
+	result = PointerGetDatum(construct_md_array(
+								 values, 
+								 nulls,
+								 1,
+								 dims,
+								 lbs,
+								 TEXTOID,
+								 -1,
+								 false,
+								 'i'));
+
+	slot->tts_values[0] = result;
+	slot->tts_isnull[0] = false;
+
+}
+
 
 /*
  * fileEndForeignScan
@@ -474,9 +788,7 @@ fileEndForeignScan(ForeignScanState *node)
 {
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
 
-	/* if festate is NULL, we are in EXPLAIN; nothing to do */
-	if (festate)
-		EndCopyFrom(festate->cstate);
+	endScan( festate );
 }
 
 /*
@@ -487,14 +799,9 @@ static void
 fileReScanForeignScan(ForeignScanState *node)
 {
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
-	char *filename_fake = NULL;
 
-	EndCopyFrom(festate->cstate);
-
-	festate->cstate = BeginCopyFrom(node->ss.ss_currentRelation,
-									filename_fake,
-									NIL,
-									festate->options);
+	endScan( festate );
+	beginScan( festate, node );
 }
 
 /*
