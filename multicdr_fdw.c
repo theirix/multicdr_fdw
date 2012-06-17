@@ -13,13 +13,16 @@
 
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_table.h"
-#include "commands/copy.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "optimizer/cost.h"
+#include "mb/pg_wchar.h"
+#include "utils/builtins.h"
+#include "utils/array.h"
 
 PG_MODULE_MAGIC;
 
@@ -44,26 +47,10 @@ static struct MultiCdrFdwOption valid_options[] = {
 	{"directory", ForeignTableRelationId},
 	{"pattern", ForeignTableRelationId},
 	{"cdrfields", ForeignTableRelationId},
+	{"fieldscount", ForeignTableRelationId},
 
-	/* Format options */
-	/* oids option is not supported */
-	{"format", ForeignTableRelationId},
-	{"header", ForeignTableRelationId},
-	{"delimiter", ForeignTableRelationId},
-	{"quote", ForeignTableRelationId},
-	{"escape", ForeignTableRelationId},
-	{"null", ForeignTableRelationId},
+	/* it's like COPY's encoding */
 	{"encoding", ForeignTableRelationId},
-
-	/*
-	 * force_quote is not supported by multicdr_fdw because it's for COPY TO.
-	 */
-
-	/*
-	 * force_not_null is not supported by multicdr_fdw.  It would need a parser
-	 * for list of columns, not to mention a way to check the column list
-	 * against the table.
-	 */
 
 	/* Sentinel */
 	{NULL, InvalidOid}
@@ -74,23 +61,40 @@ static struct MultiCdrFdwOption valid_options[] = {
  */
 typedef struct MultiCdrExecutionState
 {
+	/* parameters */
 	char		*directory;		/* directory to read */
 	char		*pattern;			/* filename pattern */
 	char		*cdrfields;		/* raw cdr fields mapping */
-	List		*options;		/* merged COPY options, excluding custom options */
-	CopyState	cstate;			/* state of reading file */
+	int 		fields_count;
+	int 		encoding;
 	
 	/* context */
-	char           *read_buf;
-	Datum          *text_array_values;
-	bool           *text_array_nulls;
-	int             recnum;
+	char		*read_buf;
+	int			read_buf_size;
+	/*Datum		*text_array_values;
+	bool		*text_array_nulls;*/
+	int			recnum;
+
+	/* file I/O */
+	int 		source;
+	char		*file_buf;
+	char		*file_buf_start;
+	char		*file_buf_end;
 
 	List			*files;
 	ListCell	*currentFile;
 } MultiCdrExecutionState;
 
-#define FILE_FDW_TEXTARRAY_STASH_INIT 64
+#define MULTICDR_FDW_INITIAL_FIELDS_SIZE 32
+#define MULTICDR_FDW_FILEBUF_SIZE 32
+
+#define MULTICDR_FDW_OPEN_FLAGS O_RDONLY 
+
+#ifdef WIN32
+#define multicdr_open _open
+#else
+#define multicdr_open open
+#endif
 
 /*
  * SQL functions
@@ -121,6 +125,10 @@ static void fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state);
 static void estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 				MultiCdrExecutionState *state,
 				Cost *startup_cost, Cost *total_cost);
+static bool
+NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate);
+static void 
+makeTextArray(MultiCdrExecutionState *festate, TupleTableSlot *slot);
 
 
 /*
@@ -154,7 +162,8 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid			catalog = PG_GETARG_OID(1);
 	char *directory = NULL, *pattern = NULL, *cdrfields = NULL;
-	List	   *other_options = NIL;
+	char *encoding = NULL;
+	int fields_count = -1;
 	ListCell   *cell;
 
 	/*
@@ -232,30 +241,54 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 						 errmsg("conflicting or redundant options")));
 			cdrfields = defGetString(def);
 		}
-		else
-			other_options = lappend(other_options, def);
+		else if (strcmp(def->defname, "fieldscount") == 0)
+		{
+			if (fields_count != -1)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			fields_count = strtol(defGetString(def), NULL, 10);
+		}
+		else if (strcmp(def->defname, "encoding") == 0)
+		{
+			if (encoding)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			encoding = defGetString(def);
+			if (pg_char_to_encoding(encoding) == -1)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("invalid encoding name '%s'", encoding)));
+		}
 	}
-
-	/*
-	 * Now apply the core COPY code's validation logic for more checks.
-	 */
-	ProcessCopyOptions(NULL, true, other_options);
 
 	/*
 	 * Options that are required for multicdr_fdw foreign tables.
 	 */
-	if (catalog == ForeignTableRelationId && directory == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-				 errmsg("directory is required for multicdr_fdw foreign tables")));
-	if (catalog == ForeignTableRelationId && pattern == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-				 errmsg("pattern is required for multicdr_fdw foreign tables")));
-	if (catalog == ForeignTableRelationId && cdrfields == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-				 errmsg("cdrfields is required for multicdr_fdw foreign tables")));
+	if (catalog == ForeignTableRelationId)
+	{
+		if (directory == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+					 errmsg("directory is required for multicdr_fdw foreign tables")));
+		if (pattern == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+					 errmsg("pattern is required for multicdr_fdw foreign tables")));
+		if (cdrfields == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+					 errmsg("cdrfields is required for multicdr_fdw foreign tables")));
+		if (fields_count < 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+					 errmsg("fields_count is required for multicdr_fdw foreign tables")));
+		if (encoding == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+					 errmsg("encoding is required for multicdr_fdw foreign tables")));
+	}
 
 	PG_RETURN_VOID();
 }
@@ -289,7 +322,7 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	ForeignTable *table;
 	ForeignServer *server;
 	ForeignDataWrapper *wrapper;
-	List	   *options, *new_options;
+	List	   *options;
 	ListCell   *lc;
 
 	/*
@@ -315,7 +348,7 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	 * Read options
 	 */
 	state->directory = state->pattern = state->cdrfields = NULL;
-	new_options = NIL;
+	state->fields_count = state->encoding = 0;
 	foreach(lc, options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
@@ -332,8 +365,14 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		{
 			state->cdrfields = defGetString(def);
 		}
-		else
-			new_options = lappend(new_options, def);
+		else if (strcmp(def->defname, "fieldscount") == 0)
+		{
+			state->fields_count = strtol( defGetString(def), NULL, 10 );
+		}
+		else if (strcmp(def->defname, "encoding") == 0)
+		{
+			state->encoding = pg_char_to_encoding(defGetString(def));
+		}
 	}
 
 	/*
@@ -346,8 +385,10 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		elog(ERROR, "pattern is required for multicdr_fdw foreign tables");
 	if (state->cdrfields == NULL)
 		elog(ERROR, "cdrfields is required for multicdr_fdw foreign tables");
-
-	state->options = new_options;
+	if (state->fields_count == 0)
+		elog(ERROR, "fields_count is required for multicdr_fdw foreign tables");
+	if (state->encoding == -1)
+		elog(ERROR, "encoding is required for multicdr_fdw foreign tables");
 }
 
 /*
@@ -404,10 +445,9 @@ enumerateFiles (MultiCdrExecutionState *state)
 	struct stat file_stat;
 	const int buf_size = 4096;
 	char full_name[buf_size];
-	int status;
 
 	state->files = NIL;
-	state->currentFile = NIL;
+	state->currentFile = NULL;
 
 	dir = opendir( state->directory );
 
@@ -438,7 +478,7 @@ enumerateFiles (MultiCdrExecutionState *state)
 			state->files = lappend(state->files, strdup(full_name));
 		}
 	}
-	state->currentFile = (char*)lfirst(list_head(state->files));
+	state->currentFile = list_head(state->files);
 
 	closedir( dir );
 	return 0;
@@ -457,44 +497,55 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 		filename = (char*) lfirst(cell);
 		elog(NOTICE, "found file: %s", filename);
 	}
-	elog(NOTICE, "current file: %s", festate->currentFile);
+	elog(NOTICE, "current file: %s", lfirst(festate->currentFile));
 
-	festate->cstate = NULL;
 	if (festate->currentFile)
 	{
-		/* Create CopyState from FDW options.  We always acquire all columns, so
-		 * as to match the expected ScanTupleSlot signature.
-		 */
-		festate->cstate = BeginCopyFrom(node->ss.ss_currentRelation,
-								 festate->currentFile,
-								 NIL,
-								 festate->options);
+		festate->source = multicdr_open( lfirst(festate->currentFile), MULTICDR_FDW_OPEN_FLAGS);
+		if (festate->source == -1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+					 errmsg("unable to open file")));
+		festate->recnum = 0;
 
 		/* set up the work area we'll use to construct the array */
-		festate->text_array_stash_size = FILE_FDW_TEXTARRAY_STASH_INIT;
-		festate->text_array_values =
-			palloc(FILE_FDW_TEXTARRAY_STASH_INIT * sizeof(Datum));
-		festate->text_array_nulls =
-			palloc(FILE_FDW_TEXTARRAY_STASH_INIT * sizeof(bool));
+		festate->read_buf_size = MULTICDR_FDW_INITIAL_FIELDS_SIZE * festate->fields_count;
+		festate->read_buf = palloc(festate->read_buf_size);
+		festate->file_buf = palloc(MULTICDR_FDW_FILEBUF_SIZE);
+		festate->file_buf_start = festate->file_buf_end = festate->file_buf;
+		/*festate->text_array_values = palloc(festate->fields_count * sizeof(Datum));
+		festate->text_array_nulls = palloc(festate->fields_count * sizeof(bool));
+		for (i = 0; i < festate->fields_count; i++)
+			festate->text_array_nulls[i] = false;*/
 	}
 }
 
 static void
 endScan(MultiCdrExecutionState *festate)
 {
+	elog(NOTICE, "endScan");
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
 	if (festate)
 	{
-		if (festate->cstate)
-		{
-			EndCopyFrom(festate->cstate);
-			festate->cstate = NULL;
-		}
+		if (festate->read_buf)
+			pfree(festate->read_buf);
+		if (festate->file_buf)
+			pfree(festate->file_buf);
+		/*if (festate->text_array_values)
+			pfree(festate->text_array_values);
+		if (festate->text_array_nulls)
+			pfree(festate->text_array_nulls);*/
 
 		if (festate->files)
 		{
 			list_free(festate->files);
 			festate->files = NIL;
+		}
+		festate->currentFile = NULL;
+		if (festate->source > 0)
+		{
+			close(festate->source);
+			festate->source = -1;
 		}
 	}
 }
@@ -518,120 +569,20 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Fetch options of foreign table */
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), festate);
 
-	/*
-	 * Save state in node->fdw_state.  We must save enough information to call
-	 * BeginCopyFrom() again.
-	 */
 	node->fdw_state = (void *) festate;
 
 	beginScan( festate, node );
 }
 
-#if 0
-bool
-MyNextCopyFrom(CopyState cstate, ExprContext *econtext,
-			 Datum *values, bool *nulls, Oid *tupleOid)
+static void
+fileErrorCallback(void *arg)
 {
-	TupleDesc	tupDesc;
-	Form_pg_attribute *attr;
-	AttrNumber	num_phys_attrs,
-				attr_count,
-				num_defaults = cstate->num_defaults;
-	FmgrInfo   *in_functions = cstate->in_functions;
-	Oid		   *typioparams = cstate->typioparams;
-	int			i;
-	int			nfields;
-	bool		isnull;
-	bool		file_has_oids = cstate->file_has_oids;
-	int		   *defmap = cstate->defmap;
-	ExprState **defexprs = cstate->defexprs;
+	MultiCdrExecutionState *festate = (MultiCdrExecutionState*) arg;
 
-	tupDesc = RelationGetDescr(cstate->rel);
-	attr = tupDesc->attrs;
-	num_phys_attrs = tupDesc->natts;
-	attr_count = list_length(cstate->attnumlist);
-	nfields = file_has_oids ? (attr_count + 1) : attr_count;
-
-	/* Initialize all values for row to NULL */
-	MemSet(values, 0, num_phys_attrs * sizeof(Datum));
-	MemSet(nulls, true, num_phys_attrs * sizeof(bool));
-
-	if (!cstate->binary)
-	{
-		char	  **field_strings;
-		ListCell   *cur;
-		int			fldct;
-		int			fieldno;
-		char	   *string;
-
-		/* read raw fields in the next line */
-		if (!NextCopyFromRawFields(cstate, &field_strings, &fldct))
-			return false;
-
-		/* check for overflowing fields */
-		if (nfields > 0 && fldct > nfields)
-			ereport(ERROR,
-					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-					 errmsg("extra data after last expected column")));
-
-		fieldno = 0;
-
-		/* Loop to read the user attributes on the line. */
-		foreach(cur, cstate->attnumlist)
-		{
-			int			attnum = lfirst_int(cur);
-			int			m = attnum - 1;
-
-			if (fieldno >= fldct)
-				ereport(ERROR,
-						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-						 errmsg("missing data for column \"%s\"",
-								NameStr(attr[m]->attname))));
-			string = field_strings[fieldno++];
-
-			if (cstate->csv_mode && string == NULL &&
-				cstate->force_notnull_flags[m])
-			{
-				/* Go ahead and read the NULL string */
-				string = cstate->null_print;
-			}
-
-			cstate->cur_attname = NameStr(attr[m]->attname);
-			cstate->cur_attval = string;
-			values[m] = InputFunctionCall(&in_functions[m],
-										  string,
-										  typioparams[m],
-										  attr[m]->atttypmod);
-			if (string != NULL)
-				nulls[m] = false;
-			cstate->cur_attname = NULL;
-			cstate->cur_attval = NULL;
-		}
-
-		Assert(fieldno == nfields);
-	}
-
-	/*
-	 * Now compute and insert any defaults available for the columns not
-	 * provided by the input data.	Anything not processed here or above will
-	 * remain NULL.
-	 */
-	for (i = 0; i < num_defaults; i++)
-	{
-		/*
-		 * The caller must supply econtext and have switched into the
-		 * per-tuple memory context in it.
-		 */
-		Assert(econtext != NULL);
-		Assert(CurrentMemoryContext == econtext->ecxt_per_tuple_memory);
-
-		values[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
-										 &nulls[defmap[i]], NULL);
-	}
-
-	return true;
+	if (festate->currentFile)
+		errcontext("MultiCDR Foreign Table filename: '%s' record: %d",
+					 lfirst(festate->currentFile), festate->recnum);
 }
-#endif
 
 /*
  * fileIterateForeignScan
@@ -644,17 +595,16 @@ fileIterateForeignScan(ForeignScanState *node)
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	bool		found;
-	char          **raw_fields;
-	int             nfields;
 	ErrorContextCallback errcontext;
 
 	/* Set up callback to identify error line number. */
-	errcontext.callback = CopyFromErrorCallback;
-	errcontext.arg = (void *) festate->cstate;
+	errcontext.callback = fileErrorCallback;
+	errcontext.arg = (void *) festate;
 	errcontext.previous = error_context_stack;
 	error_context_stack = &errcontext;
 
 	/*
+	 * FIXME deprecated comment
 	 * The protocol for loading a virtual tuple into a slot is first
 	 * ExecClearTuple, then fill the values/isnull arrays, then
 	 * ExecStoreVirtualTuple.  If we don't find another row in the file, we
@@ -667,11 +617,13 @@ fileIterateForeignScan(ForeignScanState *node)
 	 * foreign tables.
 	 */
 	ExecClearTuple(slot);
-	found = NextCopyFromRawFields(festate->cstate, &raw_fields, &nfields);
+
+	found = NextCopyFromRawFieldsSingle(festate);
 	if (found)
 	{
-		makeTextArray(festate, slot, raw_fields, nfields);
+		makeTextArray(festate, slot);
 		ExecStoreVirtualTuple(slot);
+		festate->recnum++;
 	}
 
 	/*if (found)
@@ -690,18 +642,114 @@ fileIterateForeignScan(ForeignScanState *node)
 }
 
 static bool
-NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate)
+isCrLf (char c)
+{
+	return c == '\r' || c == '\n';
+}
+
+static char*
+findEol (char *start, char *end)
+{
+	char *p;
+	for (p = start; *p && p != end; ++p)
+		if (isCrLf( *p ))
+			return p;
+	return NULL;
+}
+
+static bool
+fetchFileData(MultiCdrExecutionState *festate)
 {
 	int nread;
-
-	nread = read(festate->source, festate->read_buf, festate->read_len);
-	if (nread == 0)
+	nread = read(festate->source, festate->file_buf, MULTICDR_FDW_FILEBUF_SIZE);
+	if (nread == -1)
+	{
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("error reading from external data file %s", lfirst(festate->currentFile))));
 		return false;
-	else if (nread != festate->read_len)
-			ereport(ERROR,
-				(errcode(ERRCODE_FDW_INVALID_STRING_LENGTH_OR_BUFFER_LENGTH),
-				 errmsg("error reading fixed length record")));
+	}
+	festate->file_buf_start = festate->file_buf;
+	festate->file_buf_end = festate->file_buf + nread;
+	return true;
+}
 
+/*
+ * Read a whole line to the read_buf
+ */
+static bool
+NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate)
+{
+	int bytes_read = 0;
+	int copy_amount;
+	char *eol_pos;
+	char *end_pos;
+		
+	elog(NOTICE, "start reading new record");
+
+	/* initial filebuffer fetch */
+	if (festate->file_buf_start == festate->file_buf_end)
+	{
+		if (!fetchFileData(festate))
+			return false;
+		if (festate->file_buf_end == festate->file_buf_start)
+			return false;
+	}
+
+	/* skip all linefeeds at start of buffer */
+	for (;;)
+	{
+		/* buffer is empty */
+		if (festate->file_buf_start == festate->file_buf_end)
+		{
+			if (!fetchFileData(festate))
+				return false;
+		}
+		if (isCrLf( *(festate->file_buf_start) ))
+			++festate->file_buf_start;
+		else
+			break;
+	}
+	
+	festate->read_buf[0] = 0;
+	/* start reading */
+	for (;;)
+	{
+		eol_pos = findEol( festate->file_buf_start, festate->file_buf_end );
+		end_pos = eol_pos ? eol_pos : festate->file_buf_end;
+		copy_amount = end_pos - festate->file_buf_start;
+
+		// realloc if needed
+		if (bytes_read + copy_amount >= festate->read_buf_size)
+		{
+			festate->read_buf_size = (bytes_read + copy_amount) * 1.4;
+			elog(NOTICE, "realloc buffer to %d", festate->read_buf_size);
+			festate->read_buf = repalloc( festate->read_buf, festate->read_buf_size );
+		}
+		memcpy( festate->read_buf + bytes_read, festate->file_buf_start, copy_amount );
+		bytes_read += copy_amount;
+		if (eol_pos)
+		{
+			/* search completed, save position for next search and exit */
+			festate->file_buf_start = eol_pos;
+			festate->read_buf[bytes_read] = 0;
+			break;
+		}
+		else
+		{
+			if (festate->file_buf_end == festate->file_buf_start)
+			{
+				elog(NOTICE, "eof");
+				return true;
+			}
+			elog(NOTICE, "fetch more");
+			/* fetch new buffer and continue search */
+			if (!fetchFileData(festate))
+				return false;
+		}
+	}
+
+	elog(NOTICE, "done");
 	return true;
 }
 
@@ -709,40 +757,19 @@ NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate)
  * Construct the text array from the read in data, and stash it in the slot 
  */ 
 static void 
-makeTextArray(FileFixedLengthFdwExecutionState *festate, TupleTableSlot *slot)
+makeTextArray(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 {
-	Datum     *values;
-	bool      *nulls;
-	int        dims[1];
-	int        lbs[1];
 	int        fld;
-	Datum      result;
-	int        fldct = festate->nfields;
+	int        fldct = festate->fields_count;
 	char      *string = festate->read_buf;
-	values = festate->text_array_values;
-	nulls = festate->text_array_nulls;
 
-	dims[0] = fldct;
-	lbs[0] = 1; /* sql arrays typically start at 1 */
-
+	elog(NOTICE, "found tuple num=%d len=%d: ^^^%s$$$", festate->recnum, strlen(string), string);
+		
 	for (fld=0; fld < fldct; fld++)
 	{
-		char *start = string;
 		char *conv;
-		int  len = festate->field_lengths[fld];
-		int  slen = len, i;
-
-		if (festate->trim_all_fields)
-		{
-			/* skip leading and trailing spaces if required */
-			for (i = 0; i < slen && *start == ' '; i++)
-			{
-					start++;
-					len--;
-			}
-			while(len > 0 && start[len-1] == ' ')
-				len--;
-		}
+		int  len;
+		char tmp[32];
 
 		/*
 		 * pg_any_to_server will both validate that the input is
@@ -753,28 +780,15 @@ makeTextArray(FileFixedLengthFdwExecutionState *festate, TupleTableSlot *slot)
 		 * be null terminated, but if we get back something else
 		 * it will be (but the length will be unknown);
 		 */
-		conv = pg_any_to_server(start, len, festate->encoding);
-		if (conv == start)
-			values[fld] = PointerGetDatum(cstring_to_text_with_len(conv,len));
+		sprintf( tmp, "f%d:%d", festate->recnum, fld );
+		len = strlen(tmp);
+		conv = pg_any_to_server(tmp, len, festate->encoding);
+		if (conv == tmp)
+			slot->tts_values[fld] = PointerGetDatum(cstring_to_text_with_len(conv,len));
 		else
-			values[fld] = PointerGetDatum(cstring_to_text(conv));
-
-		string += festate->field_lengths[fld];
+			slot->tts_values[fld] = PointerGetDatum(cstring_to_text(conv));
+		slot->tts_isnull[fld] = false;
 	}
-
-	result = PointerGetDatum(construct_md_array(
-								 values, 
-								 nulls,
-								 1,
-								 dims,
-								 lbs,
-								 TEXTOID,
-								 -1,
-								 false,
-								 'i'));
-
-	slot->tts_values[0] = result;
-	slot->tts_isnull[0] = false;
 
 }
 
@@ -812,13 +826,13 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 		MultiCdrExecutionState *state,
 		Cost *startup_cost, Cost *total_cost)
 {
-	struct stat stat_buf;
+/*	struct stat stat_buf;
 	BlockNumber pages;
 	int			tuple_width;
 	double		ntuples;
 	double		nrows;
 	Cost		run_cost = 0;
-	Cost		cpu_per_tuple;
+	Cost		cpu_per_tuple;*/
 
 #if 0
 	/*
@@ -879,5 +893,5 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 
 	*startup_cost = baserel->baserestrictcost.startup;
 	*total_cost = *startup_cost * 10;
-	baserel->rows = 10;
+	baserel->rows = 1;
 }
