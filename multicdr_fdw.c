@@ -74,6 +74,9 @@ typedef struct MultiCdrExecutionState
 	/*Datum		*text_array_values;
 	bool		*text_array_nulls;*/
 	int			recnum;
+	int			cdr_row;
+	int			cdr_columns_count;
+	int			relation_columns_count;
 
 	/* file I/O */
 	int 		source;
@@ -126,9 +129,13 @@ static void estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 				MultiCdrExecutionState *state,
 				Cost *startup_cost, Cost *total_cost);
 static bool
-NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate);
-static void 
-makeTextArray(MultiCdrExecutionState *festate, TupleTableSlot *slot);
+fetchLineFromFile(MultiCdrExecutionState *festate);
+static bool
+rewindToCdrLine(MultiCdrExecutionState *festate);
+static bool 
+makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot);
+static int
+cdrFieldsCount(char* read_buf);
 
 
 /*
@@ -490,6 +497,15 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	char *filename;
 	ListCell *cell;
 
+	festate->relation_columns_count = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
+
+	/* set up memory buffers */
+	festate->read_buf_size = MULTICDR_FDW_INITIAL_FIELDS_SIZE * festate->fields_count;
+	festate->read_buf = palloc(festate->read_buf_size);
+	festate->file_buf = palloc(MULTICDR_FDW_FILEBUF_SIZE);
+	festate->file_buf_start = festate->file_buf_end = festate->file_buf;
+
+	/* get list of files */
 	enumerateFiles( festate );
 
 	foreach (cell, festate->files)
@@ -499,6 +515,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	}
 	elog(NOTICE, "current file: %s", lfirst(festate->currentFile));
 
+	/* open a file */
 	if (festate->currentFile)
 	{
 		festate->source = multicdr_open( lfirst(festate->currentFile), MULTICDR_FDW_OPEN_FLAGS);
@@ -507,16 +524,8 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 					 errmsg("unable to open file")));
 		festate->recnum = 0;
-
-		/* set up the work area we'll use to construct the array */
-		festate->read_buf_size = MULTICDR_FDW_INITIAL_FIELDS_SIZE * festate->fields_count;
-		festate->read_buf = palloc(festate->read_buf_size);
-		festate->file_buf = palloc(MULTICDR_FDW_FILEBUF_SIZE);
-		festate->file_buf_start = festate->file_buf_end = festate->file_buf;
-		/*festate->text_array_values = palloc(festate->fields_count * sizeof(Datum));
-		festate->text_array_nulls = palloc(festate->fields_count * sizeof(bool));
-		for (i = 0; i < festate->fields_count; i++)
-			festate->text_array_nulls[i] = false;*/
+		festate->cdr_row = 0;
+		festate->cdr_columns_count = 0;
 	}
 }
 
@@ -528,20 +537,22 @@ endScan(MultiCdrExecutionState *festate)
 	if (festate)
 	{
 		if (festate->read_buf)
+		{
 			pfree(festate->read_buf);
+			festate->read_buf = NULL;
+		}
 		if (festate->file_buf)
+		{
 			pfree(festate->file_buf);
-		/*if (festate->text_array_values)
-			pfree(festate->text_array_values);
-		if (festate->text_array_nulls)
-			pfree(festate->text_array_nulls);*/
+			festate->file_buf = NULL;
+		}
 
+		festate->currentFile = NULL;
 		if (festate->files)
 		{
 			list_free(festate->files);
 			festate->files = NIL;
 		}
-		festate->currentFile = NULL;
 		if (festate->source > 0)
 		{
 			close(festate->source);
@@ -618,12 +629,11 @@ fileIterateForeignScan(ForeignScanState *node)
 	 */
 	ExecClearTuple(slot);
 
-	found = NextCopyFromRawFieldsSingle(festate);
+	found = makeTuple(festate, slot);
 	if (found)
 	{
-		makeTextArray(festate, slot);
 		ExecStoreVirtualTuple(slot);
-		festate->recnum++;
+		++festate->recnum;
 	}
 
 	/*if (found)
@@ -674,18 +684,20 @@ fetchFileData(MultiCdrExecutionState *festate)
 	return true;
 }
 
+
+
 /*
  * Read a whole line to the read_buf
  */
 static bool
-NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate)
+fetchLineFromFile(MultiCdrExecutionState *festate)
 {
 	int bytes_read = 0;
 	int copy_amount;
 	char *eol_pos;
 	char *end_pos;
 		
-	elog(NOTICE, "start reading new record");
+	/*elog(NOTICE, "start reading new record");*/
 
 	/* initial filebuffer fetch */
 	if (festate->file_buf_start == festate->file_buf_end)
@@ -723,7 +735,7 @@ NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate)
 		if (bytes_read + copy_amount >= festate->read_buf_size)
 		{
 			festate->read_buf_size = (bytes_read + copy_amount) * 1.4;
-			elog(NOTICE, "realloc buffer to %d", festate->read_buf_size);
+			elog(NOTICE, "file reader: realloc buffer to %d", festate->read_buf_size);
 			festate->read_buf = repalloc( festate->read_buf, festate->read_buf_size );
 		}
 		memcpy( festate->read_buf + bytes_read, festate->file_buf_start, copy_amount );
@@ -739,37 +751,121 @@ NextCopyFromRawFieldsSingle(MultiCdrExecutionState *festate)
 		{
 			if (festate->file_buf_end == festate->file_buf_start)
 			{
-				elog(NOTICE, "eof");
-				return true;
+				elog(NOTICE, "file reader: eof");
+				return bytes_read > 0;
 			}
-			elog(NOTICE, "fetch more");
 			/* fetch new buffer and continue search */
 			if (!fetchFileData(festate))
 				return false;
 		}
 	}
 
-	elog(NOTICE, "done");
+	return bytes_read > 0;
+}
+
+/* 
+ * Count cdr fields in the line
+ * Fields are delimited by couple of spaces
+ */
+static int
+cdrFieldsCount(char* read_buf)
+{
+	int		cdr_columns;
+	char	*start, *end;
+	char  *p, *string_end;
+
+	p = read_buf;
+	string_end = read_buf + strlen(read_buf);
+
+	/*elog(NOTICE, "found string len=%d: ^^^%s$$$", strlen(p), p);*/
+
+	/* count all cdr fields*/
+	cdr_columns = 0;
+	do
+	{
+		for (start = p; start && start != string_end && *start == ' '; ++start)
+			;
+		for (end = start; end && end != string_end && *end != ' '; ++end)
+			;
+
+		p = end;
+
+		++cdr_columns;
+	} while (start != end);
+
+	/* one more column counted */
+	return cdr_columns - 1;
+}
+
+/*
+ * Rewind buffer to a good sized CDR row
+ * Post-condition: read_buf contains good cdr line with `cdr_columns_count` columns
+ * Returns true if ok, false if EOF
+ * NOTICE: cdr_row is 1-based
+ */
+static bool 
+rewindToCdrLine(MultiCdrExecutionState *festate)
+{
+	int		cdr_columns;
+
+	for (;;)
+	{
+		if (!fetchLineFromFile(festate))
+			return false;
+	
+		++festate->cdr_row;
+		
+		cdr_columns = cdrFieldsCount(festate->read_buf);
+
+		/* save real columns count */
+		/* TODO extract magic value */
+		if (cdr_columns > 4 && festate->cdr_columns_count == 0)
+		{
+			festate->cdr_columns_count = cdr_columns;
+			elog(NOTICE, "detected CDR columns count %d", cdr_columns);
+		}
+
+		/* column with a good column count */
+		if (festate->cdr_columns_count == cdr_columns)
+			break;
+		
+		/*elog(WARNING, "skip row %d with %d columns (instead of %d)",
+				festate->cdr_row, cdr_columns, festate->cdr_columns_count );*/
+	}
+
 	return true;
 }
 
 /*
  * Construct the text array from the read in data, and stash it in the slot 
  */ 
-static void 
-makeTextArray(MultiCdrExecutionState *festate, TupleTableSlot *slot)
+static bool 
+makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 {
-	int        fld;
-	int        fldct = festate->fields_count;
-	char      *string = festate->read_buf;
+	char  *p, *string_end;
+	int		column = 0;
+	char	*start, *end, *conv;
 
-	elog(NOTICE, "found tuple num=%d len=%d: ^^^%s$$$", festate->recnum, strlen(string), string);
-		
-	for (fld=0; fld < fldct; fld++)
+	if (!rewindToCdrLine(festate))
+		return false;
+	
+	/* scan fields and store in tuple */
+	p = festate->read_buf;
+	string_end = festate->read_buf + strlen(festate->read_buf);
+	
+	/*elog(NOTICE, "found good cdr string num=%d len=%d: ^^^%s$$$ (count %d)", festate->cdr_row, strlen(p), p, festate->relation_columns_count);*/
+
+	for (;;)
 	{
-		char *conv;
-		int  len;
-		char tmp[32];
+		for (start = p; start && start != string_end && *start == ' '; ++start)
+			;
+		for (end = start; end && end != string_end && *end != ' '; ++end)
+			;
+
+		p = end;
+
+		/*elog(NOTICE, "tuple %d, field %d: string %x (%x), start %x, end %x", 
+				festate->recnum, column, festate->read_buf, festate->read_buf, start, end);*/
 
 		/*
 		 * pg_any_to_server will both validate that the input is
@@ -780,16 +876,33 @@ makeTextArray(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 		 * be null terminated, but if we get back something else
 		 * it will be (but the length will be unknown);
 		 */
-		sprintf( tmp, "f%d:%d", festate->recnum, fld );
-		len = strlen(tmp);
-		conv = pg_any_to_server(tmp, len, festate->encoding);
-		if (conv == tmp)
-			slot->tts_values[fld] = PointerGetDatum(cstring_to_text_with_len(conv,len));
+
+		if (column >= festate->relation_columns_count)
+			break;
+
+		if (column > 100)
+		{
+			return false;
+		}
+
+		slot->tts_isnull[column] = start == end;
+		if (start == end)
+		{
+			/* precaution, should never happens because it's a good line there can't be empty columns */
+			slot->tts_values[column] = PointerGetDatum(NULL);
+		}
 		else
-			slot->tts_values[fld] = PointerGetDatum(cstring_to_text(conv));
-		slot->tts_isnull[fld] = false;
+		{
+			conv = pg_any_to_server(start, end-start, festate->encoding);
+			if (conv == start)
+				slot->tts_values[column] = PointerGetDatum(cstring_to_text_with_len(conv,end-start));
+			else
+				slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
+		}
+		++column;
 	}
 
+	return true;
 }
 
 
