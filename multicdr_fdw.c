@@ -420,12 +420,25 @@ static void
 fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
 	MultiCdrExecutionState state;
+	char str[4096];
+	int str_buf_size = sizeof(str);
+	char buf[64];
+	int i;
 
 	/* Fetch options */
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &state);
 
+	sprintf(str, "%d maps: ", state.map_fields_count);
+	for (i = 0; i < state.map_fields_count; ++i)
+	{
+		sprintf(buf, "%d, ", state.map_fields[i]);
+		strncat(str, buf, str_buf_size-1);
+	}
+
 	ExplainPropertyText("Foreign Directory", state.directory, es);
 	ExplainPropertyText("Foreign Pattern", state.pattern, es);
+	ExplainPropertyText("Foreign Fields Map", str, es);
+
 
 	/* Suppress file size if we're not showing cost details */
 	if (es->costs)
@@ -745,7 +758,7 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 		{
 			if (festate->file_buf_end == festate->file_buf_start)
 			{
-				elog(NOTICE, "file reader: eof");
+				/*elog(NOTICE, "file reader: eof");*/
 				return bytes_read > 0;
 			}
 			/* fetch new buffer and continue search */
@@ -765,7 +778,7 @@ static int
 parseIntArray(char *string, int **vals)
 {
 	char *start = string, *end;
-  int result, count;
+  int result, count, initial_count = 32;
 
 	if (!*string)
 	{
@@ -773,8 +786,7 @@ parseIntArray(char *string, int **vals)
 		return 0;
 	}
 	
-	/* TODO unmagic */
-	*vals = palloc(32 * sizeof(int));
+	*vals = palloc(initial_count * sizeof(int));
 
 	for (count = 0; ; ++count)
 	{
@@ -793,10 +805,11 @@ parseIntArray(char *string, int **vals)
 					(errcode(ERRCODE_SYNTAX_ERROR),
 			    	errmsg("illegal string")));
 		start = end + 1;
+		if (count >= initial_count)
+			*vals = repalloc(*vals, count * 1.4 * sizeof(int));
 	}
-
-	*vals = repalloc( *vals, count );
-	return count;
+	
+	return count+1;
 }
 
 /* 

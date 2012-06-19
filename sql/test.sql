@@ -22,5 +22,5 @@ CREATE FOREIGN TABLE multicdr_test_table (
 OPTIONS (
 	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/set2', 
 	pattern '*.cdr',
-	mapfields '',
+	mapfields '3,4,5,6,0,1,1,0,8,9',
 	encoding 'UTF-8');
