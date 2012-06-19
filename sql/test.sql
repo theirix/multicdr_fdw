@@ -19,8 +19,8 @@ CREATE FOREIGN TABLE multicdr_test_table (
     field9 text,
     field10 text
 ) SERVER multicdr_fdw_server
-OPTIONS (fieldscount '10',
-	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/set1', 
+OPTIONS (
+	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/set2', 
 	pattern '*.cdr',
-	cdrfields '',
+	mapfields '',
 	encoding 'UTF-8');

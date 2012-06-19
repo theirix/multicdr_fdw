@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * multicdr_fdw.c
- *		  foreign-data wrapper for server-side flat files.
+ *    foreign-data wrapper for server-side flat files.
  *
  *-------------------------------------------------------------------------
  */
@@ -23,6 +23,8 @@
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/array.h"
+#include "nodes/memnodes.h"
+
 
 PG_MODULE_MAGIC;
 
@@ -32,7 +34,7 @@ PG_MODULE_MAGIC;
 struct MultiCdrFdwOption
 {
 	const char *optname;
-	Oid			optcontext;		/* Oid of catalog in which option may appear */
+	Oid		optcontext;		/* Oid of catalog in which option may appear */
 };
 
 /*
@@ -46,8 +48,7 @@ static struct MultiCdrFdwOption valid_options[] = {
 	/* File options */
 	{"directory", ForeignTableRelationId},
 	{"pattern", ForeignTableRelationId},
-	{"cdrfields", ForeignTableRelationId},
-	{"fieldscount", ForeignTableRelationId},
+	{"mapfields", ForeignTableRelationId},
 
 	/* it's like COPY's encoding */
 	{"encoding", ForeignTableRelationId},
@@ -62,34 +63,38 @@ static struct MultiCdrFdwOption valid_options[] = {
 typedef struct MultiCdrExecutionState
 {
 	/* parameters */
-	char		*directory;		/* directory to read */
-	char		*pattern;			/* filename pattern */
-	char		*cdrfields;		/* raw cdr fields mapping */
-	int 		fields_count;
-	int 		encoding;
+	char	*directory;		/* directory to read */
+	char	*pattern;			/* filename pattern */
+	int		encoding;
+	int		*map_fields;				/* TODO memory leak */
+	int		map_fields_count;
 	
 	/* context */
-	char		*read_buf;
-	int			read_buf_size;
-	/*Datum		*text_array_values;
-	bool		*text_array_nulls;*/
-	int			recnum;
-	int			cdr_row;
-	int			cdr_columns_count;
-	int			relation_columns_count;
+	char	*read_buf;
+	int		read_buf_size;
+	int		recnum;
+	int		cdr_row;
+	int		cdr_columns_count;
+	int		relation_columns_count;
+
+	char	**fields_start;		/* TODO memory leak */
+	char	**fields_end;		/* TODO memory leak */
 
 	/* file I/O */
-	int 		source;
-	char		*file_buf;
-	char		*file_buf_start;
-	char		*file_buf_end;
+	int		source;
+	char	*file_buf;
+	char	*file_buf_start;
+	char	*file_buf_end;
 
-	List			*files;
-	ListCell	*currentFile;
+	List		*files;
+	ListCell *currentFile;
 } MultiCdrExecutionState;
 
-#define MULTICDR_FDW_INITIAL_FIELDS_SIZE 32
-#define MULTICDR_FDW_FILEBUF_SIZE 32
+#define MULTICDR_FDW_INITIAL_BUF_SIZE 128
+#define MULTICDR_FDW_FILEBUF_SIZE 512
+
+/* TODO make a parameter */
+#define MULTICDR_FDW_MIN_COLUMNS 5
 
 #define MULTICDR_FDW_OPEN_FLAGS O_RDONLY 
 
@@ -135,7 +140,9 @@ rewindToCdrLine(MultiCdrExecutionState *festate);
 static bool 
 makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot);
 static int
-cdrFieldsCount(char* read_buf);
+parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields);
+static int
+parseIntArray(char *string, int **vals);
 
 
 /*
@@ -157,6 +164,7 @@ multicdr_fdw_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(fdwroutine);
 }
 
+
 /*
  * Validate the generic options given to a FOREIGN DATA WRAPPER, SERVER,
  * USER MAPPING or FOREIGN TABLE that uses multicdr_fdw.
@@ -166,11 +174,11 @@ multicdr_fdw_handler(PG_FUNCTION_ARGS)
 Datum
 multicdr_fdw_validator(PG_FUNCTION_ARGS)
 {
-	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
-	Oid			catalog = PG_GETARG_OID(1);
-	char *directory = NULL, *pattern = NULL, *cdrfields = NULL;
-	char *encoding = NULL;
-	int fields_count = -1;
+	List    *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+	Oid		catalog = PG_GETARG_OID(1);
+	char *directory = NULL, *pattern = NULL, *map_fields_str = NULL, *encoding = NULL;
+	int *map_fields;
+	int map_fields_count;
 	ListCell   *cell;
 
 	/*
@@ -189,7 +197,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 	if (catalog == ForeignTableRelationId && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("only superuser can change options of a multicdr_fdw foreign table")));
+					errmsg("only superuser can change options of a multicdr_fdw foreign table")));
 
 	/*
 	 * Check that only options supported by multicdr_fdw, and allowed for the
@@ -213,14 +221,14 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			{
 				if (catalog == opt->optcontext)
 					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-									 opt->optname);
+						  opt->optname);
 			}
 
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-					 errmsg("invalid option \"%s\"", def->defname),
-					 errhint("Valid options in this context are: %s",
-							 buf.data)));
+			    	errmsg("invalid option \"%s\"", def->defname),
+			    	errhint("Valid options in this context are: %s",
+					    buf.data)));
 		}
 
 		/* Separate out own options, since ProcessCopyOptions won't allow it */
@@ -229,7 +237,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			if (directory)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
+				    	errmsg("conflicting or redundant options")));
 			directory = defGetString(def);
 		}
 		else if (strcmp(def->defname, "pattern") == 0)
@@ -237,36 +245,31 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			if (pattern)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
+				    	errmsg("conflicting or redundant options")));
 			pattern = defGetString(def);
 		}
-		else if (strcmp(def->defname, "cdrfields") == 0)
+		else if (strcmp(def->defname, "mapfields") == 0)
 		{
-			if (cdrfields)
+			if (map_fields_str)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
-			cdrfields = defGetString(def);
-		}
-		else if (strcmp(def->defname, "fieldscount") == 0)
-		{
-			if (fields_count != -1)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
-			fields_count = strtol(defGetString(def), NULL, 10);
+				    	errmsg("conflicting or redundant options")));
+			map_fields_str = defGetString(def);
+			map_fields_count = parseIntArray(map_fields_str, &map_fields);
+			if (map_fields)
+				pfree(map_fields);
 		}
 		else if (strcmp(def->defname, "encoding") == 0)
 		{
 			if (encoding)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
+				    	errmsg("conflicting or redundant options")));
 			encoding = defGetString(def);
 			if (pg_char_to_encoding(encoding) == -1)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("invalid encoding name '%s'", encoding)));
+				    	errmsg("invalid encoding name '%s'", encoding)));
 		}
 	}
 
@@ -278,23 +281,19 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 		if (directory == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-					 errmsg("directory is required for multicdr_fdw foreign tables")));
+			    	errmsg("directory is required for multicdr_fdw foreign tables")));
 		if (pattern == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-					 errmsg("pattern is required for multicdr_fdw foreign tables")));
-		if (cdrfields == NULL)
+			    	errmsg("pattern is required for multicdr_fdw foreign tables")));
+		if (map_fields_str == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-					 errmsg("cdrfields is required for multicdr_fdw foreign tables")));
-		if (fields_count < 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-					 errmsg("fields_count is required for multicdr_fdw foreign tables")));
+			    	errmsg("mapfields is required for multicdr_fdw foreign tables")));
 		if (encoding == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-					 errmsg("encoding is required for multicdr_fdw foreign tables")));
+			    	errmsg("encoding is required for multicdr_fdw foreign tables")));
 	}
 
 	PG_RETURN_VOID();
@@ -329,16 +328,12 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	ForeignTable *table;
 	ForeignServer *server;
 	ForeignDataWrapper *wrapper;
-	List	   *options;
+	List    *options;
 	ListCell   *lc;
 
 	/*
 	 * Extract options from FDW objects.  We ignore user mappings because
 	 * multicdr_fdw doesn't have any options that can be specified there.
-	 *
-	 * (XXX Actually, given the current contents of valid_options[], there's
-	 * no point in examining anything except the foreign table's own options.
-	 * Simplify?)
 	 */
 	table = GetForeignTable(foreigntableid);
 	server = GetForeignServer(table->serverid);
@@ -354,8 +349,9 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	/*
 	 * Read options
 	 */
-	state->directory = state->pattern = state->cdrfields = NULL;
-	state->fields_count = state->encoding = 0;
+	state->directory = state->pattern = NULL;
+	state->map_fields = NULL;
+	state->encoding = state->map_fields_count = 0;
 	foreach(lc, options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
@@ -368,13 +364,9 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		{
 			state->pattern = defGetString(def);
 		}
-		else if (strcmp(def->defname, "cdrfields") == 0)
+		else if (strcmp(def->defname, "mapfields") == 0)
 		{
-			state->cdrfields = defGetString(def);
-		}
-		else if (strcmp(def->defname, "fieldscount") == 0)
-		{
-			state->fields_count = strtol( defGetString(def), NULL, 10 );
+			state->map_fields_count = parseIntArray(defGetString(def), &state->map_fields);
 		}
 		else if (strcmp(def->defname, "encoding") == 0)
 		{
@@ -390,10 +382,8 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		elog(ERROR, "directory is required for multicdr_fdw foreign tables");
 	if (state->pattern == NULL)
 		elog(ERROR, "pattern is required for multicdr_fdw foreign tables");
-	if (state->cdrfields == NULL)
-		elog(ERROR, "cdrfields is required for multicdr_fdw foreign tables");
-	if (state->fields_count == 0)
-		elog(ERROR, "fields_count is required for multicdr_fdw foreign tables");
+	if (state->map_fields == NULL && state->map_fields_count != 0)
+		elog(ERROR, "mapfields is required for multicdr_fdw foreign tables");
 	if (state->encoding == -1)
 		elog(ERROR, "encoding is required for multicdr_fdw foreign tables");
 }
@@ -436,7 +426,6 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	ExplainPropertyText("Foreign Directory", state.directory, es);
 	ExplainPropertyText("Foreign Pattern", state.pattern, es);
-	ExplainPropertyText("Foreign CDR Fields", state.cdrfields, es);
 
 	/* Suppress file size if we're not showing cost details */
 	if (es->costs)
@@ -450,8 +439,8 @@ enumerateFiles (MultiCdrExecutionState *state)
 	DIR *dir;
 	struct dirent *de;
 	struct stat file_stat;
-	const int buf_size = 4096;
-	char full_name[buf_size];
+	char full_name[4096];
+	const int buf_size = sizeof(full_name);
 
 	state->files = NIL;
 	state->currentFile = NULL;
@@ -462,21 +451,21 @@ enumerateFiles (MultiCdrExecutionState *state)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_NO_DATA_FOUND),
-				 errmsg("no directory found %s", dir)));
+		    errmsg("no directory found %s", dir)));
 		return -1;
 	}
 
 	while ((de = readdir( dir )) != NULL)
 	{
-		strncpy( full_name, state->directory, sizeof(full_name)-1 );
-		strncat( full_name, "/", sizeof(full_name)-1 );
-		strncat( full_name, de->d_name, sizeof(full_name)-1 );
+		strncpy( full_name, state->directory, buf_size-1 );
+		strncat( full_name, "/", buf_size-1 );
+		strncat( full_name, de->d_name, buf_size-1 );
 		
 		if (stat( full_name, &file_stat ))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_NO_DATA_FOUND),
-					 errmsg("can't retrieve file information %s", full_name)));
+			    errmsg("can't retrieve file information %s", full_name)));
 			closedir( dir );
 			return -1;
 		}
@@ -496,14 +485,28 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 {
 	char *filename;
 	ListCell *cell;
+	int i;
 
 	festate->relation_columns_count = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
 
+	/* if none provided, create default mapping - one-to-one for existing fields */
+	if (festate->map_fields_count == 0)
+	{
+		festate->map_fields_count = festate->relation_columns_count;
+		festate->map_fields = palloc(festate->map_fields_count * sizeof(int));
+		for (i = 0; i < festate->map_fields_count; ++i)
+			festate->map_fields[i] = i;
+	}
+
 	/* set up memory buffers */
-	festate->read_buf_size = MULTICDR_FDW_INITIAL_FIELDS_SIZE * festate->fields_count;
+	festate->read_buf_size = MULTICDR_FDW_INITIAL_BUF_SIZE;
 	festate->read_buf = palloc(festate->read_buf_size);
 	festate->file_buf = palloc(MULTICDR_FDW_FILEBUF_SIZE);
 	festate->file_buf_start = festate->file_buf_end = festate->file_buf;
+
+	/* alloc fictional arrays so they saved a memory context */
+	festate->fields_start = palloc(1 * sizeof(char*));
+	festate->fields_end = palloc(1 * sizeof(char*));
 
 	/* get list of files */
 	enumerateFiles( festate );
@@ -522,7 +525,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 		if (festate->source == -1)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-					 errmsg("unable to open file")));
+			    errmsg("unable to open file")));
 		festate->recnum = 0;
 		festate->cdr_row = 0;
 		festate->cdr_columns_count = 0;
@@ -589,10 +592,10 @@ static void
 fileErrorCallback(void *arg)
 {
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState*) arg;
+	char* fn;
 
-	if (festate->currentFile)
-		errcontext("MultiCDR Foreign Table filename: '%s' record: %d",
-					 lfirst(festate->currentFile), festate->recnum);
+	fn = festate->currentFile ? lfirst(festate->currentFile) : "<none>";
+	errcontext("MultiCDR Foreign Table filename: '%s' record: %d", fn, festate->recnum);
 }
 
 /*
@@ -605,7 +608,7 @@ fileIterateForeignScan(ForeignScanState *node)
 {
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-	bool		found;
+	bool	found;
 	ErrorContextCallback errcontext;
 
 	/* Set up callback to identify error line number. */
@@ -635,15 +638,6 @@ fileIterateForeignScan(ForeignScanState *node)
 		ExecStoreVirtualTuple(slot);
 		++festate->recnum;
 	}
-
-	/*if (found)
-	{
-		elog(NOTICE, "tuple found 0: %s; %d", DatumGetCString(slot->tts_values+0), slot->tts_isnull[0]);
-		elog(NOTICE, "tuple found 1: %s; %d", DatumGetCString(slot->tts_values+1), slot->tts_isnull[1]);
-	}
-	else
-		elog(NOTICE, "tuple not found");*/
-
 
 	/* Remove error callback. */
 	error_context_stack = errcontext.previous;
@@ -676,7 +670,7 @@ fetchFileData(MultiCdrExecutionState *festate)
 	{
 		ereport(ERROR,
 			(errcode_for_file_access(),
-			 errmsg("error reading from external data file %s", lfirst(festate->currentFile))));
+	    errmsg("error reading from external data file %s", lfirst(festate->currentFile))));
 		return false;
 	}
 	festate->file_buf_start = festate->file_buf;
@@ -731,7 +725,7 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 		end_pos = eol_pos ? eol_pos : festate->file_buf_end;
 		copy_amount = end_pos - festate->file_buf_start;
 
-		// realloc if needed
+		/* realloc if needed */
 		if (bytes_read + copy_amount >= festate->read_buf_size)
 		{
 			festate->read_buf_size = (bytes_read + copy_amount) * 1.4;
@@ -763,15 +757,57 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 	return bytes_read > 0;
 }
 
+/*
+ * Parse comma-delimited integer array
+ * Returns element count
+ */
+static int
+parseIntArray(char *string, int **vals)
+{
+	char *start = string, *end;
+  int result, count;
+
+	if (!*string)
+	{
+		*vals = NULL;
+		return 0;
+	}
+	
+	/* TODO unmagic */
+	*vals = palloc(32 * sizeof(int));
+
+	for (count = 0; ; ++count)
+	{
+		result = strtol(start,&end,10);
+		if (end == start)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+			    errmsg("illegal string")));
+		(*vals)[count] = result;
+		while (*end == ' ')
+			++end;
+		if (!*end)
+				break;
+		if (*end != ',')
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+			    	errmsg("illegal string")));
+		start = end + 1;
+	}
+
+	*vals = repalloc( *vals, count );
+	return count;
+}
+
 /* 
  * Count cdr fields in the line
  * Fields are delimited by couple of spaces
  */
 static int
-cdrFieldsCount(char* read_buf)
+parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields)
 {
-	int		cdr_columns;
-	char	*start, *end;
+	int	cdr_columns;
+	char *start, *end;
 	char  *p, *string_end;
 
 	p = read_buf;
@@ -780,22 +816,35 @@ cdrFieldsCount(char* read_buf)
 	/*elog(NOTICE, "found string len=%d: ^^^%s$$$", strlen(p), p);*/
 
 	/* count all cdr fields*/
+
 	cdr_columns = 0;
-	do
+	for (start = NULL, end = start + 1; start != end; ++cdr_columns)
 	{
 		for (start = p; start && start != string_end && *start == ' '; ++start)
 			;
 		for (end = start; end && end != string_end && *end != ' '; ++end)
 			;
+		/*elog(NOTICE, "YYY %d %x %x", cdr_columns, start, end);*/
+
+		if (max_fields && cdr_columns >= max_fields)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					errmsg("column %d is out of range %d", cdr_columns, max_fields)));
+		}
+
+		if (fields_start)
+			fields_start[cdr_columns] = start;
+		if (fields_end)
+			fields_end[cdr_columns] = end;
 
 		p = end;
+	}
 
-		++cdr_columns;
-	} while (start != end);
-
-	/* one more column counted */
-	return cdr_columns - 1;
+	return cdr_columns;
 }
+
+
 
 /*
  * Rewind buffer to a good sized CDR row
@@ -806,7 +855,8 @@ cdrFieldsCount(char* read_buf)
 static bool 
 rewindToCdrLine(MultiCdrExecutionState *festate)
 {
-	int		cdr_columns;
+	int	cdr_columns;
+	int i;
 
 	for (;;)
 	{
@@ -815,22 +865,36 @@ rewindToCdrLine(MultiCdrExecutionState *festate)
 	
 		++festate->cdr_row;
 		
-		cdr_columns = cdrFieldsCount(festate->read_buf);
+		/*elog(NOTICE, "current row %d", festate->cdr_row);*/
+		
+		cdr_columns = parseLine(festate->read_buf, NULL, NULL, 0);
 
 		/* save real columns count */
-		/* TODO extract magic value */
-		if (cdr_columns > 4 && festate->cdr_columns_count == 0)
+		if (cdr_columns > MULTICDR_FDW_MIN_COLUMNS && festate->cdr_columns_count == 0)
 		{
-			festate->cdr_columns_count = cdr_columns;
 			elog(NOTICE, "detected CDR columns count %d", cdr_columns);
+			festate->cdr_columns_count = cdr_columns;
+			festate->fields_start = repalloc(festate->fields_start, festate->cdr_columns_count * sizeof(char*));
+			festate->fields_end = repalloc(festate->fields_end, festate->cdr_columns_count * sizeof(char*));
+
+			/* verify that a mapping is feasible */
+			for (i = 0; i < festate->map_fields_count; ++i)
+			{
+				if (festate->map_fields[i] < 0 || festate->map_fields[i] >= festate->cdr_columns_count)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+							 errmsg("can't map field #%d to CDR field #%d", i, festate->map_fields[i])));
+				}
+			}
 		}
 
 		/* column with a good column count */
 		if (festate->cdr_columns_count == cdr_columns)
 			break;
 		
-		/*elog(WARNING, "skip row %d with %d columns (instead of %d)",
-				festate->cdr_row, cdr_columns, festate->cdr_columns_count );*/
+		elog(WARNING, "skip row %d with %d columns (instead of %d)",
+				festate->cdr_row, cdr_columns, festate->cdr_columns_count );
 	}
 
 	return true;
@@ -842,48 +906,21 @@ rewindToCdrLine(MultiCdrExecutionState *festate)
 static bool 
 makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 {
-	char  *p, *string_end;
-	int		column = 0;
-	char	*start, *end, *conv;
+	int	column, cdr_field_mapped;
+	char *start, *end, *conv, *temp;
 
 	if (!rewindToCdrLine(festate))
 		return false;
 	
-	/* scan fields and store in tuple */
-	p = festate->read_buf;
-	string_end = festate->read_buf + strlen(festate->read_buf);
+	parseLine(festate->read_buf, festate->fields_start, festate->fields_end, festate->cdr_columns_count);
 	
-	/*elog(NOTICE, "found good cdr string num=%d len=%d: ^^^%s$$$ (count %d)", festate->cdr_row, strlen(p), p, festate->relation_columns_count);*/
-
-	for (;;)
+	for (column = 0; column < festate->relation_columns_count; ++column)
 	{
-		for (start = p; start && start != string_end && *start == ' '; ++start)
-			;
-		for (end = start; end && end != string_end && *end != ' '; ++end)
-			;
+		cdr_field_mapped = festate->map_fields[column];
+		start = festate->fields_start[cdr_field_mapped];
+		end = festate->fields_end[cdr_field_mapped];
 
-		p = end;
-
-		/*elog(NOTICE, "tuple %d, field %d: string %x (%x), start %x, end %x", 
-				festate->recnum, column, festate->read_buf, festate->read_buf, start, end);*/
-
-		/*
-		 * pg_any_to_server will both validate that the input is
-		 * ok in the named encoding and translate it from that into the
-		 * current server encoding.
-		 *
-		 * If the string handed back is what we passed in it won't
-		 * be null terminated, but if we get back something else
-		 * it will be (but the length will be unknown);
-		 */
-
-		if (column >= festate->relation_columns_count)
-			break;
-
-		if (column > 100)
-		{
-			return false;
-		}
+		/*elog(NOTICE, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
 
 		slot->tts_isnull[column] = start == end;
 		if (start == end)
@@ -893,13 +930,11 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 		}
 		else
 		{
-			conv = pg_any_to_server(start, end-start, festate->encoding);
-			if (conv == start)
-				slot->tts_values[column] = PointerGetDatum(cstring_to_text_with_len(conv,end-start));
-			else
-				slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
+			temp = pnstrdup(start, end-start);
+			conv = pg_any_to_server(temp, end-start, festate->encoding);
+			slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
+			pfree(temp);
 		}
-		++column;
 	}
 
 	return true;
@@ -941,11 +976,11 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 {
 /*	struct stat stat_buf;
 	BlockNumber pages;
-	int			tuple_width;
-	double		ntuples;
-	double		nrows;
-	Cost		run_cost = 0;
-	Cost		cpu_per_tuple;*/
+	int		tuple_width;
+	double	ntuples;
+	double	nrows;
+	Cost	run_cost = 0;
+	Cost	cpu_per_tuple;*/
 
 #if 0
 	/*
