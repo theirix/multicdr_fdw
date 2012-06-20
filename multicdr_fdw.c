@@ -49,6 +49,7 @@ static struct MultiCdrFdwOption valid_options[] = {
 	{"directory", ForeignTableRelationId},
 	{"pattern", ForeignTableRelationId},
 	{"mapfields", ForeignTableRelationId},
+	{"filefield", ForeignTableRelationId},
 
 	/* it's like COPY's encoding */
 	{"encoding", ForeignTableRelationId},
@@ -65,8 +66,10 @@ typedef struct MultiCdrExecutionState
 	/* parameters */
 	char	*directory;		/* directory to read */
 	char	*pattern;			/* filename pattern */
+	char	*file_field;
+	int		file_field_column;
 	int		encoding;
-	int		*map_fields;				/* TODO memory leak */
+	int		*map_fields;				
 	int		map_fields_count;
 	
 	/* context */
@@ -77,8 +80,8 @@ typedef struct MultiCdrExecutionState
 	int		cdr_columns_count;
 	int		relation_columns_count;
 
-	char	**fields_start;		/* TODO memory leak */
-	char	**fields_end;		/* TODO memory leak */
+	char	**fields_start;	
+	char	**fields_end;		
 
 	/* file I/O */
 	int		source;
@@ -87,14 +90,14 @@ typedef struct MultiCdrExecutionState
 	char	*file_buf_end;
 
 	List		*files;
-	ListCell *currentFile;
+	ListCell *current_file;
 } MultiCdrExecutionState;
 
 #define MULTICDR_FDW_INITIAL_BUF_SIZE 128
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
 /* TODO make a parameter */
-#define MULTICDR_FDW_MIN_COLUMNS 5
+#define MULTICDR_FDW_MIN_COLUMNS 4
 
 #define MULTICDR_FDW_OPEN_FLAGS O_RDONLY 
 
@@ -176,7 +179,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List    *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid		catalog = PG_GETARG_OID(1);
-	char *directory = NULL, *pattern = NULL, *map_fields_str = NULL, *encoding = NULL;
+	char *directory = NULL, *pattern = NULL, *file_field = NULL, *map_fields_str = NULL, *encoding = NULL;
 	int *map_fields;
 	int map_fields_count;
 	ListCell   *cell;
@@ -247,6 +250,14 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_SYNTAX_ERROR),
 				    	errmsg("conflicting or redundant options")));
 			pattern = defGetString(def);
+		}
+		else if (strcmp(def->defname, "filefield") == 0)
+		{
+			if (file_field)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+				    	errmsg("conflicting or redundant options")));
+			file_field = defGetString(def);
 		}
 		else if (strcmp(def->defname, "mapfields") == 0)
 		{
@@ -349,7 +360,7 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	/*
 	 * Read options
 	 */
-	state->directory = state->pattern = NULL;
+	state->directory = state->pattern = state->file_field = NULL;
 	state->map_fields = NULL;
 	state->encoding = state->map_fields_count = 0;
 	foreach(lc, options)
@@ -363,6 +374,12 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		else if (strcmp(def->defname, "pattern") == 0)
 		{
 			state->pattern = defGetString(def);
+		}
+		else if (strcmp(def->defname, "filefield") == 0)
+		{
+			state->file_field = defGetString(def);
+			if (!strlen(state->file_field))
+				state->file_field = NULL;
 		}
 		else if (strcmp(def->defname, "mapfields") == 0)
 		{
@@ -456,7 +473,7 @@ enumerateFiles (MultiCdrExecutionState *state)
 	const int buf_size = sizeof(full_name);
 
 	state->files = NIL;
-	state->currentFile = NULL;
+	state->current_file = NULL;
 
 	dir = opendir( state->directory );
 
@@ -487,7 +504,7 @@ enumerateFiles (MultiCdrExecutionState *state)
 			state->files = lappend(state->files, strdup(full_name));
 		}
 	}
-	state->currentFile = list_head(state->files);
+	state->current_file = list_head(state->files);
 
 	closedir( dir );
 	return 0;
@@ -501,6 +518,18 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	int i;
 
 	festate->relation_columns_count = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
+
+	/* find a column with filename, may be -1 if none specified */
+	festate->file_field_column = -1;
+	if (festate->file_field && strlen(festate->file_field))
+	{
+		for (i = 0; i < festate->relation_columns_count; ++i)
+		{
+			if (!strcmp(node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->attrs[i]->attname.data, festate->file_field))
+				festate->file_field_column = i;
+		}
+	}
+	elog(NOTICE, "Field with a filename: %d", festate->file_field_column);
 
 	/* if none provided, create default mapping - one-to-one for existing fields */
 	if (festate->map_fields_count == 0)
@@ -529,12 +558,12 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 		filename = (char*) lfirst(cell);
 		elog(NOTICE, "found file: %s", filename);
 	}
-	elog(NOTICE, "current file: %s", lfirst(festate->currentFile));
+	elog(NOTICE, "current file: %s", lfirst(festate->current_file));
 
 	/* open a file */
-	if (festate->currentFile)
+	if (festate->current_file)
 	{
-		festate->source = multicdr_open( lfirst(festate->currentFile), MULTICDR_FDW_OPEN_FLAGS);
+		festate->source = multicdr_open( lfirst(festate->current_file), MULTICDR_FDW_OPEN_FLAGS);
 		if (festate->source == -1)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
@@ -553,17 +582,17 @@ endScan(MultiCdrExecutionState *festate)
 	if (festate)
 	{
 		if (festate->read_buf)
-		{
 			pfree(festate->read_buf);
-			festate->read_buf = NULL;
-		}
 		if (festate->file_buf)
-		{
 			pfree(festate->file_buf);
-			festate->file_buf = NULL;
-		}
+		if (festate->fields_start)
+			pfree(festate->fields_start);
+		if (festate->fields_end)
+			pfree(festate->fields_end);
+		if (festate->map_fields)
+			pfree(festate->map_fields);
 
-		festate->currentFile = NULL;
+		festate->current_file = NULL;
 		if (festate->files)
 		{
 			list_free(festate->files);
@@ -607,7 +636,7 @@ fileErrorCallback(void *arg)
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState*) arg;
 	char* fn;
 
-	fn = festate->currentFile ? lfirst(festate->currentFile) : "<none>";
+	fn = festate->current_file ? lfirst(festate->current_file) : "<none>";
 	errcontext("MultiCDR Foreign Table filename: '%s' record: %d", fn, festate->recnum);
 }
 
@@ -683,7 +712,7 @@ fetchFileData(MultiCdrExecutionState *festate)
 	{
 		ereport(ERROR,
 			(errcode_for_file_access(),
-	    errmsg("error reading from external data file %s", lfirst(festate->currentFile))));
+	    errmsg("error reading from external data file %s", lfirst(festate->current_file))));
 		return false;
 	}
 	festate->file_buf_start = festate->file_buf;
@@ -883,7 +912,7 @@ rewindToCdrLine(MultiCdrExecutionState *festate)
 		cdr_columns = parseLine(festate->read_buf, NULL, NULL, 0);
 
 		/* save real columns count */
-		if (cdr_columns > MULTICDR_FDW_MIN_COLUMNS && festate->cdr_columns_count == 0)
+		if (cdr_columns >= MULTICDR_FDW_MIN_COLUMNS && festate->cdr_columns_count == 0)
 		{
 			elog(NOTICE, "detected CDR columns count %d", cdr_columns);
 			festate->cdr_columns_count = cdr_columns;
@@ -929,24 +958,33 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 	
 	for (column = 0; column < festate->relation_columns_count; ++column)
 	{
-		cdr_field_mapped = festate->map_fields[column];
-		start = festate->fields_start[cdr_field_mapped];
-		end = festate->fields_end[cdr_field_mapped];
-
-		/*elog(NOTICE, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
-
-		slot->tts_isnull[column] = start == end;
-		if (start == end)
+		/* save a current filename if asked */
+		if (column == festate->file_field_column)
 		{
-			/* precaution, should never happens because it's a good line there can't be empty columns */
-			slot->tts_values[column] = PointerGetDatum(NULL);
+			slot->tts_isnull[column] = false;
+			slot->tts_values[column] = PointerGetDatum(cstring_to_text(lfirst(festate->current_file)));
 		}
 		else
 		{
-			temp = pnstrdup(start, end-start);
-			conv = pg_any_to_server(temp, end-start, festate->encoding);
-			slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
-			pfree(temp);
+			cdr_field_mapped = festate->map_fields[column];
+			start = festate->fields_start[cdr_field_mapped];
+			end = festate->fields_end[cdr_field_mapped];
+
+			/*elog(NOTICE, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
+
+			slot->tts_isnull[column] = start == end;
+			if (start == end)
+			{
+				/* precaution, should never happens because it's a good line there can't be empty columns */
+				slot->tts_values[column] = PointerGetDatum(NULL);
+			}
+			else
+			{
+				temp = pnstrdup(start, end-start);
+				conv = pg_any_to_server(temp, end-start, festate->encoding);
+				slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
+				pfree(temp);
+			}
 		}
 	}
 
