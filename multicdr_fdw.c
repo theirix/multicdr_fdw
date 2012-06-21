@@ -14,6 +14,7 @@
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_collation.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "foreign/fdwapi.h"
@@ -21,6 +22,7 @@
 #include "miscadmin.h"
 #include "optimizer/cost.h"
 #include "mb/pg_wchar.h"
+#include "regex/regex.h"
 #include "utils/builtins.h"
 #include "utils/array.h"
 #include "nodes/memnodes.h"
@@ -65,14 +67,14 @@ static struct MultiCdrFdwOption valid_options[] = {
 typedef struct MultiCdrExecutionState
 {
 	/* parameters */
-	char	*directory;		/* directory to read */
-	char	*pattern;			/* filename pattern */
-	char	*file_field;
-	int		file_field_column;
-	int		encoding;
-	int		*map_fields;				
-	int		map_fields_count;
-	int		min_fields;
+	char		*directory;		/* directory to read */
+	regex_t	pattern_regex;
+	char		*file_field;
+	int			file_field_column;
+	int			encoding;
+	int			*map_fields;
+	int			map_fields_count;
+	int			min_fields;
 	
 	/* context */
 	char	*read_buf;
@@ -355,6 +357,19 @@ is_valid_option(const char *option, Oid context)
 	return false;
 }
 
+static void
+ereportRegexError(regex_t* regex, int err)
+{
+	char *buf = NULL;
+	size_t buf_len = 0;
+	buf_len = pg_regerror(err, regex, buf, buf_len);
+	buf = palloc(buf_len);
+	buf_len = pg_regerror(err, regex, buf, buf_len);
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+			 errmsg("invalid regular expression: %s", buf)));
+}
+
 /*
  * Fetch the options for a multicdr_fdw foreign table.
  *
@@ -369,6 +384,10 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	ForeignDataWrapper *wrapper;
 	List    *options;
 	ListCell   *lc;
+
+	char *tpattern;
+	pg_wchar *wpattern;
+	int err;
 
 	/*
 	 * Extract options from FDW objects.  We ignore user mappings because
@@ -388,7 +407,7 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	/*
 	 * Read options
 	 */
-	state->directory = state->pattern = state->file_field = NULL;
+	state->directory = state->file_field = NULL;
 	state->map_fields = NULL;
 	state->encoding = state->map_fields_count = 0;
 	state->min_fields = 0;
@@ -402,7 +421,16 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		}
 		else if (strcmp(def->defname, "pattern") == 0)
 		{
-			state->pattern = defGetString(def);
+			tpattern = defGetString(def);
+
+			wpattern = (pg_wchar*) palloc((strlen(tpattern) + 1) * sizeof(pg_wchar));
+			pg_mb2wchar(tpattern, wpattern);
+
+			err = pg_regcomp(&state->pattern_regex, wpattern, pg_wchar_strlen(wpattern), 
+					REG_NOSUB|REG_EXTENDED,DEFAULT_COLLATION_OID);
+			if (err)
+				ereportRegexError(&state->pattern_regex, err);
+			pfree(wpattern);
 		}
 		else if (strcmp(def->defname, "filefield") == 0)
 		{
@@ -458,25 +486,11 @@ static void
 fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
 	MultiCdrExecutionState state;
-	char str[4096];
-	int str_buf_size = sizeof(str);
-	char buf[64];
-	int i;
 
 	/* Fetch options */
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &state);
 
-	sprintf(str, "%d maps: ", state.map_fields_count);
-	for (i = 0; i < state.map_fields_count; ++i)
-	{
-		sprintf(buf, "%d, ", state.map_fields[i]);
-		strncat(str, buf, str_buf_size-1);
-	}
-
 	ExplainPropertyText("Foreign Directory", state.directory, es);
-	ExplainPropertyText("Foreign Pattern", state.pattern, es);
-	ExplainPropertyText("Foreign Fields Map", str, es);
-
 
 	/* Suppress file size if we're not showing cost details */
 	if (es->costs)
@@ -490,8 +504,10 @@ enumerateFiles (MultiCdrExecutionState *festate)
 	DIR *dir;
 	struct dirent *de;
 	struct stat file_stat;
-	char full_name[4096];
-	const int buf_size = sizeof(full_name);
+	char path[MAXPGPATH];
+	const int buf_size = sizeof(path);
+	int err;
+	pg_wchar *wpath;
 
 	festate->files = NIL;
 	festate->current_file = NULL;
@@ -508,21 +524,33 @@ enumerateFiles (MultiCdrExecutionState *festate)
 
 	while ((de = readdir( dir )) != NULL)
 	{
-		strncpy( full_name, festate->directory, buf_size-1 );
-		strncat( full_name, "/", buf_size-1 );
-		strncat( full_name, de->d_name, buf_size-1 );
+		strncpy( path, festate->directory, buf_size-1 );
+		strncat( path, "/", buf_size-1 );
+		strncat( path, de->d_name, buf_size-1 );
 		
-		if (stat( full_name, &file_stat ))
+		if (stat( path, &file_stat ))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_NO_DATA_FOUND),
-			    errmsg("can't retrieve file information %s", full_name)));
+			    errmsg("can't retrieve file information %s", path)));
 			closedir( dir );
 			return -1;
 		}
 		if ((file_stat.st_mode & S_IFREG) != 0)
 		{
-			festate->files = lappend(festate->files, strdup(full_name));
+			wpath = (pg_wchar*) palloc((strlen(path) + 1) * sizeof(pg_wchar));
+			pg_mb2wchar(path, wpath);
+
+			err = pg_regexec(&festate->pattern_regex, wpath, pg_wchar_strlen(wpath), 0, NULL, 0, NULL, 0);
+			if (err)
+			{
+				elog(NOTICE, "skip unmatched file %s", path);
+			}
+			else
+			{
+				festate->files = lappend(festate->files, strdup(path));
+			}
+			pfree(wpath);
 		}
 	}
 
@@ -649,6 +677,7 @@ endScan(MultiCdrExecutionState *festate)
 			close(festate->source);
 			festate->source = 0;
 		}
+		pg_regfree(&festate->pattern_regex);
 	}
 }
 
