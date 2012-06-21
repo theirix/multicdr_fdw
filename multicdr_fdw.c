@@ -97,7 +97,7 @@ typedef struct MultiCdrExecutionState
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
 /* TODO make a parameter */
-#define MULTICDR_FDW_MIN_COLUMNS 4
+#define MULTICDR_FDW_MIN_COLUMNS 5
 
 #define MULTICDR_FDW_OPEN_FLAGS O_RDONLY 
 
@@ -137,7 +137,11 @@ static void estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 				MultiCdrExecutionState *state,
 				Cost *startup_cost, Cost *total_cost);
 static bool
+fetchFileData(MultiCdrExecutionState *festate);
+static bool
 fetchLineFromFile(MultiCdrExecutionState *festate);
+static bool
+fetchLine(MultiCdrExecutionState *festate);
 static bool
 rewindToCdrLine(MultiCdrExecutionState *festate);
 static bool 
@@ -146,6 +150,8 @@ static int
 parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields);
 static int
 parseIntArray(char *string, int **vals);
+static bool
+moveToNextFile(MultiCdrExecutionState *festate);
 
 
 /*
@@ -464,7 +470,7 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 }
 
 static int
-enumerateFiles (MultiCdrExecutionState *state)
+enumerateFiles (MultiCdrExecutionState *festate)
 {
 	DIR *dir;
 	struct dirent *de;
@@ -472,10 +478,10 @@ enumerateFiles (MultiCdrExecutionState *state)
 	char full_name[4096];
 	const int buf_size = sizeof(full_name);
 
-	state->files = NIL;
-	state->current_file = NULL;
+	festate->files = NIL;
+	festate->current_file = NULL;
 
-	dir = opendir( state->directory );
+	dir = opendir( festate->directory );
 
 	if (!dir)
 	{
@@ -487,7 +493,7 @@ enumerateFiles (MultiCdrExecutionState *state)
 
 	while ((de = readdir( dir )) != NULL)
 	{
-		strncpy( full_name, state->directory, buf_size-1 );
+		strncpy( full_name, festate->directory, buf_size-1 );
 		strncat( full_name, "/", buf_size-1 );
 		strncat( full_name, de->d_name, buf_size-1 );
 		
@@ -501,10 +507,9 @@ enumerateFiles (MultiCdrExecutionState *state)
 		}
 		if ((file_stat.st_mode & S_IFREG) != 0)
 		{
-			state->files = lappend(state->files, strdup(full_name));
+			festate->files = lappend(festate->files, strdup(full_name));
 		}
 	}
-	state->current_file = list_head(state->files);
 
 	closedir( dir );
 	return 0;
@@ -513,7 +518,6 @@ enumerateFiles (MultiCdrExecutionState *state)
 static void
 beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 {
-	char *filename;
 	ListCell *cell;
 	int i;
 
@@ -550,29 +554,56 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	festate->fields_start = palloc(1 * sizeof(char*));
 	festate->fields_end = palloc(1 * sizeof(char*));
 
+	festate->recnum = 0;
+	festate->cdr_columns_count = 0;
+
 	/* get list of files */
 	enumerateFiles( festate );
 
 	foreach (cell, festate->files)
 	{
-		filename = (char*) lfirst(cell);
-		elog(NOTICE, "found file: %s", filename);
+		elog(NOTICE, "found file: %s", (char*)lfirst(cell));
 	}
+
+	moveToNextFile(festate);
+}
+
+static bool
+moveToNextFile(MultiCdrExecutionState *festate)
+{
+	bool is_first;
+
+	is_first = festate->current_file == NULL;
+	if (is_first)
+		festate->current_file = list_head(festate->files);
+	else
+		festate->current_file = lnext(festate->current_file);
+
+	if (festate->current_file == NULL)
+		return false;
+	
 	elog(NOTICE, "current file: %s", lfirst(festate->current_file));
 
-	/* open a file */
-	if (festate->current_file)
+	if (!is_first)
 	{
-		festate->source = multicdr_open( lfirst(festate->current_file), MULTICDR_FDW_OPEN_FLAGS);
-		if (festate->source == -1)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-			    errmsg("unable to open file")));
-		festate->recnum = 0;
-		festate->cdr_row = 0;
-		festate->cdr_columns_count = 0;
+		Assert(festate->source > 0);
+		if (festate->source > 0)
+			close(festate->source);
 	}
+
+	/* open a file */
+	festate->source = multicdr_open( lfirst(festate->current_file), MULTICDR_FDW_OPEN_FLAGS);
+	if (festate->source == -1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+				errmsg("unable to open file")));
+
+	/* reset counters and file-specific data */
+	festate->cdr_row = 0;
+
+	return true;
 }
+
 
 static void
 endScan(MultiCdrExecutionState *festate)
@@ -601,7 +632,7 @@ endScan(MultiCdrExecutionState *festate)
 		if (festate->source > 0)
 		{
 			close(festate->source);
-			festate->source = -1;
+			festate->source = 0;
 		}
 	}
 }
@@ -674,11 +705,14 @@ fileIterateForeignScan(ForeignScanState *node)
 	 */
 	ExecClearTuple(slot);
 
-	found = makeTuple(festate, slot);
-	if (found)
+	if (festate->current_file != NULL)
 	{
-		ExecStoreVirtualTuple(slot);
-		++festate->recnum;
+		found = makeTuple(festate, slot);
+		if (found)
+		{
+			ExecStoreVirtualTuple(slot);
+			++festate->recnum;
+		}
 	}
 
 	/* Remove error callback. */
@@ -719,8 +753,6 @@ fetchFileData(MultiCdrExecutionState *festate)
 	festate->file_buf_end = festate->file_buf + nread;
 	return true;
 }
-
-
 
 /*
  * Read a whole line to the read_buf
@@ -799,6 +831,23 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 	return bytes_read > 0;
 }
 
+static bool
+fetchLine(MultiCdrExecutionState *festate)
+{
+	if (fetchLineFromFile(festate))
+		return true;
+
+	elog(NOTICE, "fetch line failed, total read %d lines, move to next file", festate->cdr_row);
+	/* eof */
+	if (!moveToNextFile(festate))
+	{
+		elog(NOTICE, "all files scanned");
+		return false;
+	}
+	/* retry reading */
+	return fetchLineFromFile(festate);
+}
+
 /*
  * Parse comma-delimited integer array
  * Returns element count
@@ -855,18 +904,19 @@ parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields
 	p = read_buf;
 	string_end = read_buf + strlen(read_buf);
 
-	/*elog(NOTICE, "found string len=%d: ^^^%s$$$", strlen(p), p);*/
-
 	/* count all cdr fields*/
 
 	cdr_columns = 0;
-	for (start = NULL, end = start + 1; start != end; ++cdr_columns)
+	for (;;)
 	{
 		for (start = p; start && start != string_end && *start == ' '; ++start)
 			;
 		for (end = start; end && end != string_end && *end != ' '; ++end)
 			;
-		/*elog(NOTICE, "YYY %d %x %x", cdr_columns, start, end);*/
+		/*elog(NOTICE, "YYY %d %x %x %s", cdr_columns, start, end, start);*/
+
+		if (start == end)
+			break;
 
 		if (max_fields && cdr_columns >= max_fields)
 		{
@@ -881,6 +931,7 @@ parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields
 			fields_end[cdr_columns] = end;
 
 		p = end;
+		++cdr_columns;
 	}
 
 	return cdr_columns;
@@ -902,12 +953,10 @@ rewindToCdrLine(MultiCdrExecutionState *festate)
 
 	for (;;)
 	{
-		if (!fetchLineFromFile(festate))
+		if (!fetchLine(festate))
 			return false;
 	
 		++festate->cdr_row;
-		
-		/*elog(NOTICE, "current row %d", festate->cdr_row);*/
 		
 		cdr_columns = parseLine(festate->read_buf, NULL, NULL, 0);
 
