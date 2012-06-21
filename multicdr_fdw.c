@@ -102,6 +102,8 @@ typedef struct MultiCdrExecutionState
 
 #define MULTICDR_FDW_OPEN_FLAGS O_RDONLY 
 
+#define MULTICDR_FDW_TRACE_LEVEL DEBUG5
+
 #ifdef WIN32
 #define multicdr_open _open
 #else
@@ -491,11 +493,6 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &state);
 
 	ExplainPropertyText("Foreign Directory", state.directory, es);
-
-	/* Suppress file size if we're not showing cost details */
-	if (es->costs)
-	{
-	}
 }
 
 static int
@@ -544,7 +541,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 			err = pg_regexec(&festate->pattern_regex, wpath, pg_wchar_strlen(wpath), 0, NULL, 0, NULL, 0);
 			if (err)
 			{
-				elog(NOTICE, "skip unmatched file %s", path);
+				elog(MULTICDR_FDW_TRACE_LEVEL, "skip unmatched file %s", path);
 			}
 			else
 			{
@@ -576,7 +573,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 				festate->file_field_column = i;
 		}
 	}
-	elog(NOTICE, "Field with a filename: %d", festate->file_field_column);
+	elog(MULTICDR_FDW_TRACE_LEVEL, "Field with a filename: %d", festate->file_field_column);
 
 	/* if none provided, create default mapping - one-to-one for existing fields */
 	if (festate->map_fields_count == 0)
@@ -605,7 +602,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 
 	foreach (cell, festate->files)
 	{
-		elog(NOTICE, "found file: %s", (char*)lfirst(cell));
+		elog(MULTICDR_FDW_TRACE_LEVEL, "found file: %s", (char*)lfirst(cell));
 	}
 
 	moveToNextFile(festate);
@@ -625,7 +622,7 @@ moveToNextFile(MultiCdrExecutionState *festate)
 	if (festate->current_file == NULL)
 		return false;
 	
-	elog(NOTICE, "current file: %s", lfirst(festate->current_file));
+	elog(MULTICDR_FDW_TRACE_LEVEL, "current file: %s", lfirst(festate->current_file));
 
 	if (!is_first)
 	{
@@ -651,7 +648,7 @@ moveToNextFile(MultiCdrExecutionState *festate)
 static void
 endScan(MultiCdrExecutionState *festate)
 {
-	elog(NOTICE, "endScan");
+	elog(MULTICDR_FDW_TRACE_LEVEL, "endScan");
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
 	if (festate)
 	{
@@ -735,7 +732,6 @@ fileIterateForeignScan(ForeignScanState *node)
 	error_context_stack = &errcontext;
 
 	/*
-	 * FIXME deprecated comment
 	 * The protocol for loading a virtual tuple into a slot is first
 	 * ExecClearTuple, then fill the values/isnull arrays, then
 	 * ExecStoreVirtualTuple.  If we don't find another row in the file, we
@@ -809,7 +805,7 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 	char *eol_pos;
 	char *end_pos;
 		
-	/*elog(NOTICE, "start reading new record");*/
+	/*elog(MULTICDR_FDW_TRACE_LEVEL, "start reading new record");*/
 
 	/* initial filebuffer fetch */
 	if (festate->file_buf_start == festate->file_buf_end)
@@ -847,7 +843,7 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 		if (bytes_read + copy_amount >= festate->read_buf_size)
 		{
 			festate->read_buf_size = (bytes_read + copy_amount) * 1.4;
-			elog(NOTICE, "file reader: realloc buffer to %d", festate->read_buf_size);
+			elog(MULTICDR_FDW_TRACE_LEVEL, "file reader: realloc buffer to %d", festate->read_buf_size);
 			festate->read_buf = repalloc( festate->read_buf, festate->read_buf_size );
 		}
 		memcpy( festate->read_buf + bytes_read, festate->file_buf_start, copy_amount );
@@ -863,7 +859,7 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 		{
 			if (festate->file_buf_end == festate->file_buf_start)
 			{
-				/*elog(NOTICE, "file reader: eof");*/
+				/*elog(MULTICDR_FDW_TRACE_LEVEL, "file reader: eof");*/
 				return bytes_read > 0;
 			}
 			/* fetch new buffer and continue search */
@@ -881,11 +877,11 @@ fetchLine(MultiCdrExecutionState *festate)
 	if (fetchLineFromFile(festate))
 		return true;
 
-	elog(NOTICE, "fetch line failed, total read %d lines, move to next file", festate->cdr_row);
+	elog(MULTICDR_FDW_TRACE_LEVEL, "fetch line failed, total read %d lines, move to next file", festate->cdr_row);
 	/* eof */
 	if (!moveToNextFile(festate))
 	{
-		elog(NOTICE, "all files scanned");
+		elog(MULTICDR_FDW_TRACE_LEVEL, "all files scanned");
 		return false;
 	}
 	/* retry reading */
@@ -986,7 +982,7 @@ parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields
  * Rewind buffer to a good sized CDR row
  * Post-condition: read_buf contains good cdr line with `cdr_columns_count` columns
  * Returns true if ok, false if EOF
- * NOTICE: cdr_row is 1-based
+ * Note: cdr_row is 1-based
  */
 static bool 
 rewindToCdrLine(MultiCdrExecutionState *festate)
@@ -1006,7 +1002,7 @@ rewindToCdrLine(MultiCdrExecutionState *festate)
 		/* save real columns count */
 		if (cdr_columns >= festate->min_fields && festate->cdr_columns_count == 0)
 		{
-			elog(NOTICE, "detected CDR columns count %d with min=%d", cdr_columns, festate->min_fields);
+			elog(MULTICDR_FDW_TRACE_LEVEL, "detected CDR columns count %d with min=%d", cdr_columns, festate->min_fields);
 			festate->cdr_columns_count = cdr_columns;
 			festate->fields_start = repalloc(festate->fields_start, festate->cdr_columns_count * sizeof(char*));
 			festate->fields_end = repalloc(festate->fields_end, festate->cdr_columns_count * sizeof(char*));
@@ -1027,8 +1023,8 @@ rewindToCdrLine(MultiCdrExecutionState *festate)
 		if (festate->cdr_columns_count == cdr_columns)
 			break;
 		
-		elog(WARNING, "skip row %d with %d columns (instead of %d)",
-				festate->cdr_row, cdr_columns, festate->cdr_columns_count );
+		/*elog(WARNING, "skip row %d with %d columns (instead of %d)",
+				festate->cdr_row, cdr_columns, festate->cdr_columns_count );*/
 	}
 
 	return true;
@@ -1062,7 +1058,7 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 			start = festate->fields_start[cdr_field_mapped];
 			end = festate->fields_end[cdr_field_mapped];
 
-			/*elog(NOTICE, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
+			/*elog(MULTICDR_FDW_TRACE_LEVEL, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
 
 			slot->tts_isnull[column] = start == end;
 			if (start == end)
