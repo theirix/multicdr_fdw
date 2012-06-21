@@ -1,7 +1,13 @@
 /*-------------------------------------------------------------------------
  *
  * multicdr_fdw.c
- *    foreign-data wrapper for server-side flat files.
+ *    foreign-data wrapper for multiple CDR files
+ *
+ * Copyright (c) 2012, Con Certeza
+ * Author: irix <theirix@concerteza.ru>
+ *
+ * FDW wrapper is inspired by the file_fdw (postgres contrib module)
+ * and file_fixed_length_fdw (https://github.com/adunstan)
  *
  *-------------------------------------------------------------------------
  */
