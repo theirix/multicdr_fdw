@@ -23,4 +23,5 @@ OPTIONS (
 	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/set2', 
 	pattern '*.cdr',
 	mapfields '3,4,5,6,0,1,1,0,8,9',
+	minfields '5',
 	encoding 'UTF-8');
