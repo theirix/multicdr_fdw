@@ -470,7 +470,7 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	/* Fetch options */
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &state);
 
-	ExplainPropertyText("Foreign Directory", state.directory, es);
+	/*ExplainPropertyText("Foreign Directory", state.directory, es);*/
 }
 
 static int
@@ -493,7 +493,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 	{
 		ereport(ERROR,
 				(errcode_for_file_access(),
-		    errmsg("can't open directory \"%s\": %m", dir)));
+		    errmsg("cannot open directory \"%s\": %m", festate->directory)));
 		return -1;
 	}
 
@@ -507,7 +507,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 		{
 			ereport(ERROR,
 					(errcode_for_file_access(),
-			    errmsg("can't retrieve file information for \"%s\"", path)));
+			    errmsg("cannot retrieve file information for \"%s\"", path)));
 			closedir( dir );
 			return -1;
 		}
@@ -592,11 +592,12 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	/* verify that a mapping is feasible */
 	for (i = 0; i < festate->map_fields_count; ++i)
 	{
-		if (festate->map_fields[i] < 0 || festate->map_fields[i] >= festate->cdr_columns_count)
+		if ((festate->map_fields[i] < 0 || festate->map_fields[i] >= festate->cdr_columns_count) &&
+					i != festate->file_field_column)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("can't map field #%d to CDR field #%d", i, festate->map_fields[i])));
+					 errmsg("cannot map field #%d to CDR field #%d", i, festate->map_fields[i])));
 		}
 	}
 
@@ -804,7 +805,7 @@ fetchFileData(MultiCdrExecutionState *festate)
 	{
 		ereport(ERROR,
 			(errcode_for_file_access(),
-	    errmsg("can't read from data file %s", lfirst(festate->current_file))));
+	    errmsg("cannot read from data file %s", lfirst(festate->current_file))));
 		return false;
 	}
 	festate->file_buf_start = festate->file_buf;
@@ -938,7 +939,7 @@ parseIntArray(char *string, int **vals)
 		if (end == start)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-			    errmsg("can't parse array")));
+			    errmsg("cannot parse array")));
 		(*vals)[count] = result;
 		while (*end == ' ')
 			++end;
@@ -947,7 +948,7 @@ parseIntArray(char *string, int **vals)
 		if (*end != ',')
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-			    	errmsg("can't parse array")));
+			    	errmsg("cannot parse array")));
 		start = end + 1;
 		if (count >= initial_count)
 			*vals = repalloc(*vals, count * 1.4 * sizeof(int));
@@ -1065,7 +1066,7 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 
 			/*elog(MULTICDR_FDW_TRACE_LEVEL, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
 
-			/* check is a precaution, should never happens because if it's a good line there can't be empty columns */
+			/* check is a precaution, should never happens because if it's a good line there cannot be empty columns */
 			if (start != end)
 			{
 				temp = pnstrdup(start, end-start);
@@ -1120,7 +1121,7 @@ fileReScanForeignScan(ForeignScanState *node)
 
 /*
  * Estimate costs of scanning a foreign table.
- * Actually we can't provide any estimation because estimation itself
+ * Actually we cannot provide any estimation because estimation itself
  * is very resourse-hungry
  */
 static void

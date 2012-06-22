@@ -1,0 +1,370 @@
+--
+-- Test foreign-data wrapper multicdr_fdw.
+--
+-- Clean up in case a prior regression run failed
+SET client_min_messages TO 'error';
+DROP ROLE IF EXISTS file_fdw_superuser, file_fdw_user, no_priv_user;
+RESET client_min_messages;
+CREATE ROLE file_fdw_superuser LOGIN SUPERUSER; -- is a superuser
+CREATE ROLE file_fdw_user LOGIN;                -- has priv and user mapping
+CREATE ROLE no_priv_user LOGIN;                 -- has priv but no user mapping
+-- Install multicdr_fdw
+CREATE EXTENSION multicdr_fdw;
+-- file_fdw_superuser owns fdw-related objects
+SET ROLE file_fdw_superuser;
+CREATE SERVER file_server FOREIGN DATA WRAPPER multicdr_fdw;
+-- privilege tests
+SET ROLE file_fdw_user;
+CREATE FOREIGN DATA WRAPPER file_fdw2 HANDLER file_fdw_handler VALIDATOR file_fdw_validator;   -- ERROR
+ERROR:  permission denied to create foreign-data wrapper "file_fdw2"
+HINT:  Must be superuser to create a foreign-data wrapper.
+CREATE SERVER file_server2 FOREIGN DATA WRAPPER multicdr_fdw;   -- ERROR
+ERROR:  permission denied for foreign-data wrapper multicdr_fdw
+CREATE USER MAPPING FOR file_fdw_user SERVER file_server;   -- ERROR
+ERROR:  permission denied for foreign server file_server
+SET ROLE file_fdw_superuser;
+GRANT USAGE ON FOREIGN SERVER file_server TO file_fdw_user;
+SET ROLE file_fdw_user;
+CREATE USER MAPPING FOR file_fdw_user SERVER file_server;
+-- create user mappings and grant privilege to test users
+SET ROLE file_fdw_superuser;
+CREATE USER MAPPING FOR file_fdw_superuser SERVER file_server;
+CREATE USER MAPPING FOR no_priv_user SERVER file_server;
+-- validator tests
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory '');      -- ERROR
+ERROR:  pattern is required for foreign table
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory '', pattern '', mapfields '');      -- ERROR
+ERROR:  mapfields is required for foreign table
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (posfields '1,foo,2');          -- ERROR
+ERROR:  cannot parse array
+CREATE FOREIGN TABLE tbl () SERVER file_server;  -- ERROR
+ERROR:  directory is required for foreign table
+CREATE FOREIGN TABLE tbl_alpha (
+  f1 text,
+  f2 int4,
+  f3 text,
+  f4 int4,
+  f5 text
+) SERVER file_server
+OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '');
+CREATE FOREIGN TABLE tbl_beta (
+  f1 text,
+  f2 int4,
+  f3 text,
+  f4 int4,
+  f5 text
+) SERVER file_server
+OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '');
+GRANT SELECT ON tbl_beta TO file_fdw_user;
+CREATE FOREIGN TABLE tbl_bad (
+  f1 text,
+  f2 text
+) SERVER file_server
+OPTIONS (directory '@abs_srcdir@/data/regression9000', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '');
+-- basic query tests
+SELECT * FROM tbl_alpha ORDER BY f4;
+ f1 | f2 |         f3          |   f4   |       f5        
+----+----+---------------------+--------+-----------------
+ -5 | 10 | I501059845516040    |     24 | 296487514560383
+ -1 | 10 | O520280597676258    |     51 | 027386199028423
+ -7 | 20 | O4395503825302498   |     53 | 211569653648233
+ -2 | 20 | I13108447853599932  |     59 | 153088598461700
+ -2 | 10 | I7240320923723539   |     69 | 193161641481202
+ -6 | 10 | I799089765591618    |     78 | 292644197998720
+ -6 | 20 | I449710280586504    |    538 | 442922748137325
+ -5 | 20 | I9303960726186915   |    933 | 800775266536367
+ -9 | 20 | I377079950605549    |    939 | 858544817146251
+ -5 | 10 | I764064272987391    |    948 | 446617839477149
+ -5 | 10 | O6593028239174455   |   1816 | 248939183449443
+ -9 | 10 | O80187718991624685  |   2872 | 881057258184107
+ -8 | 10 | I2675777049722644   |   2939 | 712080444068539
+ -6 | 20 | O0219224905512521   |   3887 | 843965136261098
+ -0 | 20 | I864379806422008746 |   6435 | 667701477760382
+ -1 | 10 | I7156011726657294   |   8956 | 351246619922996
+ -3 | 20 | I92805833598100674  |  91812 | 297709284174310
+ -1 | 10 | I42570425600513503  | 552723 | 855192482600769
+ -7 | 20 | O81416279888891729  | 896989 | 926710766239136
+(19 rows)
+
+SELECT * FROM tbl_beta WHERE f4 < 5 AND f2 < 7 ORDER BY f5;
+ f1 | f2 |         f3          | f4 |       f5        
+----+----+---------------------+----+-----------------
+ -6 |  6 | I742042944467698    |  0 | 016871449275371
+ -3 |  6 | I647428037758171    |  0 | 078375333131628
+ -0 |  4 | O8123298082707693   |  2 | 088291020284695
+ -5 |  6 | O8985849894519823   |  2 | 089328565689232
+ -6 |  1 | I020356498884934    |  4 | 115673513037286
+ -2 |  2 | I9729968403529082   |  1 | 120929991081371
+ -2 |  4 | I4026249677311182   |  0 | 132200378706283
+ -0 |  6 | I1513670963501392   |  2 | 137565845051430
+ -5 |  0 | I56648592342829202  |  2 | 163075078345066
+ -5 |  2 | I7003244941665811   |  0 | 176064960784435
+ -5 |  0 | O9990124864606074   |  1 | 182107758327386
+ -4 |  1 | I130323880984036    |  1 | 200102953025535
+ -5 |  4 | I9590809917105852   |  2 | 243948664823595
+ -9 |  5 | I514323619752337    |  0 | 265988196571755
+ -5 |  3 | I2414793943861908   |  0 | 323578537261341
+ -3 |  6 | O4112194628591126   |  0 | 330277926389080
+ -8 |  5 | I913146415277287    |  0 | 367528928897546
+ -6 |  2 | I47118499546374576  |  1 | 396771491266799
+ -0 |  4 | I895674023068131    |  1 | 441186411828802
+ -5 |  2 | I676751579737671251 |  0 | 465133905072562
+ -7 |  1 | I878115907115379    |  2 | 480099919148619
+ -5 |  5 | O74575053032194625  |  4 | 525644752997730
+ -0 |  6 | I034306466228531    |  1 | 554937971801388
+ -1 |  1 | I313234310079636    |  4 | 557223283129642
+ -4 |  4 | O6267431062892990   |  3 | 637209197203864
+ -1 |  2 | I953004645206864    |  2 | 653905278884481
+ -7 |  5 | I462312552835687    |  3 | 666987683110135
+ -5 |  0 | I255466586280375    |  1 | 670848449541585
+ -4 |  4 | I6063608461583594   |  1 | 702720733739807
+ -0 |  3 | I8889973654749612   |  2 | 721094257270362
+ -1 |  0 | I321991839009116228 |  4 | 777768285452592
+ -6 |  3 | I82047088102856193  |  3 | 875958767788964
+ -0 |  3 | O3706784883548632   |  2 | 878868180374946
+ -0 |  2 | O4377468947393373   |  2 | 887824201290431
+ -3 |  6 | I0359969615331195   |  0 | 907082021667109
+ -3 |  2 | I80842243706526368  |  0 | 919493643503868
+ -6 |  6 | O524642490183695    |  4 | 927621278677505
+(37 rows)
+
+SELECT * FROM tbl_alpha c JOIN tbl_beta t ON (t.f2 = c.f2) ORDER BY c.f4; -- TODO FIXME 
+ERROR:  cannot map field #0 to CDR field #2139062143
+-- rows count
+\t on
+SELECT SUM(f4) FROM tbl_alpha;      -- 1572121
+ 1572121
+
+SELECT count(*) FROM tbl_alpha;     -- 19
+    19
+
+SELECT count(*) FROM tbl_beta;      -- 58960
+ 58960
+
+\t off
+-- error context report tests
+SELECT * FROM tbl_bad;               -- ERROR
+ERROR:  cannot open directory "@abs_srcdir@/data/regression9000": No such file or directory
+-- misc query tests
+\t on
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM tbl_alpha;
+ Foreign Scan on public.tbl_alpha
+   Output: f1, f2, f3, f4, f5
+
+\t off
+PREPARE st(int) AS SELECT * FROM tbl_alpha WHERE f2 = $1;
+EXECUTE st(10);
+ f1 | f2 |         f3         |   f4   |       f5        
+----+----+--------------------+--------+-----------------
+ -5 | 10 | I764064272987391   |    948 | 446617839477149
+ -5 | 10 | I501059845516040   |     24 | 296487514560383
+ -2 | 10 | I7240320923723539  |     69 | 193161641481202
+ -1 | 10 | I7156011726657294  |   8956 | 351246619922996
+ -6 | 10 | I799089765591618   |     78 | 292644197998720
+ -1 | 10 | O520280597676258   |     51 | 027386199028423
+ -8 | 10 | I2675777049722644  |   2939 | 712080444068539
+ -5 | 10 | O6593028239174455  |   1816 | 248939183449443
+ -1 | 10 | I42570425600513503 | 552723 | 855192482600769
+ -9 | 10 | O80187718991624685 |   2872 | 881057258184107
+(10 rows)
+
+EXECUTE st(20);
+ f1 | f2 |         f3          |   f4   |       f5        
+----+----+---------------------+--------+-----------------
+ -5 | 20 | I9303960726186915   |    933 | 800775266536367
+ -2 | 20 | I13108447853599932  |     59 | 153088598461700
+ -6 | 20 | O0219224905512521   |   3887 | 843965136261098
+ -7 | 20 | O4395503825302498   |     53 | 211569653648233
+ -9 | 20 | I377079950605549    |    939 | 858544817146251
+ -6 | 20 | I449710280586504    |    538 | 442922748137325
+ -3 | 20 | I92805833598100674  |  91812 | 297709284174310
+ -7 | 20 | O81416279888891729  | 896989 | 926710766239136
+ -0 | 20 | I864379806422008746 |   6435 | 667701477760382
+(9 rows)
+
+DEALLOCATE st;
+-- tableoid
+SELECT tableoid::regclass, f2 FROM tbl_alpha;
+ tableoid  | f2 
+-----------+----
+ tbl_alpha | 10
+ tbl_alpha | 20
+ tbl_alpha | 10
+ tbl_alpha | 20
+ tbl_alpha | 10
+ tbl_alpha | 10
+ tbl_alpha | 20
+ tbl_alpha | 20
+ tbl_alpha | 10
+ tbl_alpha | 10
+ tbl_alpha | 20
+ tbl_alpha | 20
+ tbl_alpha | 10
+ tbl_alpha | 10
+ tbl_alpha | 10
+ tbl_alpha | 10
+ tbl_alpha | 20
+ tbl_alpha | 20
+ tbl_alpha | 20
+(19 rows)
+
+-- updates aren't supported
+INSERT INTO tbl_alpha VALUES(1,2); -- ERROR
+ERROR:  cannot change foreign table "tbl_alpha"
+UPDATE tbl_alpha SET f2 = 1; -- ERROR
+ERROR:  cannot change foreign table "tbl_alpha"
+DELETE FROM tbl_alpha WHERE f2 = 100; -- ERROR
+ERROR:  cannot change foreign table "tbl_alpha"
+SELECT * FROM tbl_alpha FOR UPDATE OF tbl_alpha; -- ERROR
+ERROR:  SELECT FOR UPDATE/SHARE cannot be used with foreign table "tbl_alpha"
+LINE 1: SELECT * FROM tbl_alpha FOR UPDATE OF tbl_alpha;
+                                              ^
+-- but this should be ignored
+SELECT * FROM tbl_alpha FOR UPDATE;
+ f1 | f2 |         f3          |   f4   |       f5        
+----+----+---------------------+--------+-----------------
+ -5 | 10 | I764064272987391    |    948 | 446617839477149
+ -5 | 20 | I9303960726186915   |    933 | 800775266536367
+ -5 | 10 | I501059845516040    |     24 | 296487514560383
+ -2 | 20 | I13108447853599932  |     59 | 153088598461700
+ -2 | 10 | I7240320923723539   |     69 | 193161641481202
+ -1 | 10 | I7156011726657294   |   8956 | 351246619922996
+ -6 | 20 | O0219224905512521   |   3887 | 843965136261098
+ -7 | 20 | O4395503825302498   |     53 | 211569653648233
+ -6 | 10 | I799089765591618    |     78 | 292644197998720
+ -1 | 10 | O520280597676258    |     51 | 027386199028423
+ -9 | 20 | I377079950605549    |    939 | 858544817146251
+ -6 | 20 | I449710280586504    |    538 | 442922748137325
+ -8 | 10 | I2675777049722644   |   2939 | 712080444068539
+ -5 | 10 | O6593028239174455   |   1816 | 248939183449443
+ -1 | 10 | I42570425600513503  | 552723 | 855192482600769
+ -9 | 10 | O80187718991624685  |   2872 | 881057258184107
+ -3 | 20 | I92805833598100674  |  91812 | 297709284174310
+ -7 | 20 | O81416279888891729  | 896989 | 926710766239136
+ -0 | 20 | I864379806422008746 |   6435 | 667701477760382
+(19 rows)
+
+-- privilege tests
+SET ROLE file_fdw_superuser;
+SELECT * FROM tbl_beta WHERE f4 < 32 ORDER BY f2 LIMIT 5;
+ f1 | f2 |         f3         | f4 |       f5        
+----+----+--------------------+----+-----------------
+ -2 |  0 | I640522572650487   |  7 | 522498161257599
+ -5 |  0 | O4361860429184496  | 12 | 912112625371969
+ -4 |  0 | I264341851359599   | 27 | 203151065924474
+ -5 |  0 | O9990124864606074  |  1 | 182107758327386
+ -0 |  0 | I65283656407831130 | 10 | 252335616527823
+(5 rows)
+
+SET ROLE file_fdw_user;
+SELECT * FROM tbl_beta WHERE f4 < 32 ORDER BY f2 LIMIT 5;
+ f1 | f2 |         f3         | f4 |       f5        
+----+----+--------------------+----+-----------------
+ -2 |  0 | I640522572650487   |  7 | 522498161257599
+ -5 |  0 | O4361860429184496  | 12 | 912112625371969
+ -4 |  0 | I264341851359599   | 27 | 203151065924474
+ -5 |  0 | O9990124864606074  |  1 | 182107758327386
+ -0 |  0 | I65283656407831130 | 10 | 252335616527823
+(5 rows)
+
+SET ROLE no_priv_user;
+SELECT * FROM tbl_beta WHERE f4 < 32 ORDER BY f2;   -- ERROR
+ERROR:  permission denied for relation tbl_beta
+SET ROLE file_fdw_user;
+\t on
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM tbl_beta WHERE f2 > 0;
+ Foreign Scan on public.tbl_beta
+   Output: f1, f2, f3, f4, f5
+   Filter: (tbl_beta.f2 > 0)
+
+\t off
+-- privilege tests for object
+SET ROLE file_fdw_superuser;
+ALTER FOREIGN TABLE tbl_beta OWNER TO file_fdw_user;
+ALTER FOREIGN TABLE tbl_beta OPTIONS (SET directory 'foobar');
+SET ROLE file_fdw_user;
+ALTER FOREIGN TABLE tbl_beta OPTIONS (SET directory 'foobar'); -- ERROR
+ERROR:  only superuser can change options of a multicdr_fdw foreign table
+SET ROLE file_fdw_superuser;
+-- mapping tests
+CREATE FOREIGN TABLE tbl_gamma (
+  f1 text,
+  f2 int4,
+  f3 text,
+  f4 int4,
+  f5 text
+) SERVER file_server
+OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,2,1,0');
+SELECT * FROM tbl_gamma ORDER BY f2;
+       f1        |   f2   |         f3          | f4 | f5 
+-----------------+--------+---------------------+----+----
+ 296487514560383 |     24 | I501059845516040    | 10 | -5
+ 027386199028423 |     51 | O520280597676258    | 10 | -1
+ 211569653648233 |     53 | O4395503825302498   | 20 | -7
+ 153088598461700 |     59 | I13108447853599932  | 20 | -2
+ 193161641481202 |     69 | I7240320923723539   | 10 | -2
+ 292644197998720 |     78 | I799089765591618    | 10 | -6
+ 442922748137325 |    538 | I449710280586504    | 20 | -6
+ 800775266536367 |    933 | I9303960726186915   | 20 | -5
+ 858544817146251 |    939 | I377079950605549    | 20 | -9
+ 446617839477149 |    948 | I764064272987391    | 10 | -5
+ 248939183449443 |   1816 | O6593028239174455   | 10 | -5
+ 881057258184107 |   2872 | O80187718991624685  | 10 | -9
+ 712080444068539 |   2939 | I2675777049722644   | 10 | -8
+ 843965136261098 |   3887 | O0219224905512521   | 20 | -6
+ 667701477760382 |   6435 | I864379806422008746 | 20 | -0
+ 351246619922996 |   8956 | I7156011726657294   | 10 | -1
+ 297709284174310 |  91812 | I92805833598100674  | 20 | -3
+ 855192482600769 | 552723 | I42570425600513503  | 10 | -1
+ 926710766239136 | 896989 | O81416279888891729  | 20 | -7
+(19 rows)
+
+\t on
+SELECT SUM(f2) FROM tbl_gamma;      -- 1572121
+ 1572121
+
+\t off
+-- filefield test one
+DROP FOREIGN TABLE tbl_gamma;
+CREATE FOREIGN TABLE tbl_gamma (
+  f1 text,
+  f2 int4,
+  f3 text,
+  f4 int4,
+  filename text
+) SERVER file_server
+OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,2,1,0', filefield 'filename');
+\t on
+SELECT distinct filename FROM tbl_gamma;
+ @abs_srcdir@/data/regression1/data1.cdr
+
+\t off
+-- filefield test two
+DROP FOREIGN TABLE tbl_gamma;
+CREATE FOREIGN TABLE tbl_gamma (
+  f1 text,
+  f2 int4,
+  filename text,
+  f3 text,
+  f4 int4
+) SERVER file_server
+OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,-1,1,0', filefield 'filename');
+\t on
+SELECT count(DISTINCT Filename) FROM tbl_gamma; -- 4
+     4
+
+\t off
+-- cleanup
+RESET ROLE;
+DROP EXTENSION multicdr_fdw CASCADE;
+NOTICE:  drop cascades to 8 other objects
+DETAIL:  drop cascades to server file_server
+drop cascades to user mapping for file_fdw_user
+drop cascades to user mapping for file_fdw_superuser
+drop cascades to user mapping for no_priv_user
+drop cascades to foreign table tbl_alpha
+drop cascades to foreign table tbl_beta
+drop cascades to foreign table tbl_bad
+drop cascades to foreign table tbl_gamma
+DROP ROLE file_fdw_superuser, file_fdw_user, no_priv_user;
+-- vim: ft=sql
