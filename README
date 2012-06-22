@@ -1,0 +1,77 @@
+MultiCDR FDW
+===================
+
+Foreign Data Wrapper for dealing with multiple CDR files.
+CDR files from a directory can be read into a table with a 
+specified field-to-column mapping.
+
+Usage
+-------------------
+
+Please refer to a PostgreSQL Foreign Data Wrapper documentation.
+In a few words extension, foreign data server and foreign table
+must be created with a superuser permission. Then a user with 
+appropriate permissions can select CDR data from a table.
+
+CDR file consists of multiple rows. Each row contains space-delimited
+data entries. Some special rows could be ignored if they contains
+not enough columns.
+
+Options
+-------------------
+
+* directory. Text, mandatory.
+A directory where FDW should look for files. Scan is not recursive.
+
+* pattern. Text, mandatory.
+Posix Extended regex for selecting a file path.
+
+* mapfields. Text array with a comma-separated integers, optional.
+Specifies a mapping from table columns to a CDR fields. For example, "4,5,6"
+says that fourth, fifth and sixth fields from each CDR row will be read to a
+table. An array and a table must have equal dimensions.
+Fields will be mapped sequentially if mapfields is not specified.
+
+* minfields. Text with a integer, mandatory.
+Minimal fields count for a valid CDR row.
+
+* encoding. Text, mandatory.
+Encoding of files.
+
+* filefield. Text, optional.
+Name of the column that should contain a row's file path.
+
+
+Building
+-------------------
+
+1. Install a postgres 9.1 or newer
+2. Build an extension
+		make PG_CONFIG=/usr/local/postgre91/bin/pg_config clean all install
+3. Restart a server
+4. Create extension, foreign server and table
+
+Example initialization sql script
+-------------------
+
+-- Should be run by a superuser
+
+CREATE EXTENSION multicdr_fdw;
+
+DROP FOREIGN TABLE IF EXISTS multicdr_test_table;
+DROP SERVER IF EXISTS multicdr_fdw_server;
+
+CREATE SERVER multicdr_fdw_server FOREIGN DATA WRAPPER multicdr_fdw;
+
+CREATE FOREIGN TABLE multicdr_test_table (
+    field1 text,
+    field2 text,
+    field3 text,
+    field4 text,
+    field5 text,
+) SERVER multicdr_fdw_server OPTIONS (
+	directory '/opt/pool',
+	pattern '.*\.cdr',
+	mapfields '3,4,5,0,1',
+	minfields '5',
+	encoding 'UTF-8');
