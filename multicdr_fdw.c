@@ -56,6 +56,7 @@ static struct MultiCdrFdwOption valid_options[] = {
 	/* File options */
 	{"directory", ForeignTableRelationId},
 	{"pattern", ForeignTableRelationId},
+	{"posfields", ForeignTableRelationId},
 	{"mapfields", ForeignTableRelationId},
 	{"filefield", ForeignTableRelationId},
 	{"minfields", ForeignTableRelationId},
@@ -78,6 +79,8 @@ typedef struct MultiCdrExecutionState
 	char		*file_field;
 	int			file_field_column;
 	int			encoding;
+	int			*pos_fields;
+	int			pos_fields_count;
 	int			*map_fields;
 	int			map_fields_count;
 	int			min_fields;
@@ -109,12 +112,6 @@ typedef struct MultiCdrExecutionState
 #define MULTICDR_FDW_OPEN_FLAGS O_RDONLY 
 
 #define MULTICDR_FDW_TRACE_LEVEL DEBUG5
-
-#ifdef WIN32
-#define multicdr_open _open
-#else
-#define multicdr_open open
-#endif
 
 /*
  * SQL functions
@@ -155,8 +152,8 @@ static bool
 rewindToCdrLine(MultiCdrExecutionState *festate);
 static bool 
 makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot);
-static int
-parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields);
+static bool
+parseLine(MultiCdrExecutionState *festate);
 static int
 parseIntArray(char *string, int **vals);
 static bool
@@ -194,10 +191,11 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List    *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid		catalog = PG_GETARG_OID(1);
-	char *directory = NULL, *pattern = NULL, *file_field = NULL, *map_fields_str = NULL, *min_fields_str = NULL,
+	char *directory = NULL, *pattern = NULL, *file_field = NULL, 
+				*map_fields_str = NULL, *pos_fields_str = NULL, *min_fields_str = NULL,
 				*encoding = NULL;
-	int *map_fields;
-	int map_fields_count;
+	int *map_fields, *pos_fields;
+	int map_fields_count, pos_fields_count;
 	int min_fields;
 	ListCell   *cell;
 
@@ -291,6 +289,21 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			if (map_fields)
 				pfree(map_fields);
 		}
+		else if (strcmp(def->defname, "posfields") == 0)
+		{
+			if (pos_fields_str)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+				    	errmsg("conflicting or redundant options")));
+			pos_fields_str = defGetString(def);
+			pos_fields_count = parseIntArray(pos_fields_str, &pos_fields);
+			if (pos_fields == NULL || pos_fields_count <= 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+				    	errmsg("invalid map fields")));
+			if (pos_fields)
+				pfree(pos_fields);
+		}
 		else if (strcmp(def->defname, "minfields") == 0)
 		{
 			if (min_fields_str)
@@ -331,6 +344,10 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
 			    	errmsg("pattern is required for multicdr_fdw foreign tables")));
+		if (pos_fields_str == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+			    	errmsg("mapfields is required for multicdr_fdw foreign tables")));
 		if (map_fields_str == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
@@ -445,6 +462,10 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 			state->file_field = defGetString(def);
 			if (!strlen(state->file_field))
 				state->file_field = NULL;
+		}
+		else if (strcmp(def->defname, "posfields") == 0)
+		{
+			state->pos_fields_count = parseIntArray(defGetString(def), &state->pos_fields);
 		}
 		else if (strcmp(def->defname, "mapfields") == 0)
 		{
@@ -569,6 +590,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 
 	festate->relation_columns_count = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
 
+
 	/* find a column with filename, may be -1 if none specified */
 	festate->file_field_column = -1;
 	if (festate->file_field && strlen(festate->file_field))
@@ -596,12 +618,26 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	festate->file_buf = palloc(MULTICDR_FDW_FILEBUF_SIZE);
 	festate->file_buf_start = festate->file_buf_end = festate->file_buf;
 
-	/* alloc fictional arrays so they saved a memory context */
-	festate->fields_start = palloc(1 * sizeof(char*));
-	festate->fields_end = palloc(1 * sizeof(char*));
+	/* column count is specified at config */
+	festate->cdr_columns_count = festate->pos_fields_count;
+	festate->fields_start = palloc(festate->cdr_columns_count * sizeof(char*));
+	festate->fields_end = palloc(festate->cdr_columns_count * sizeof(char*));
+			
+	/* verify that a mapping is feasible */
+	for (i = 0; i < festate->map_fields_count; ++i)
+	{
+		if (festate->map_fields[i] < 0 || festate->map_fields[i] >= festate->cdr_columns_count)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("can't map field #%d to CDR field #%d", i, festate->map_fields[i])));
+		}
+	}
+	elog(MULTICDR_FDW_TRACE_LEVEL, "detected CDR columns count %d with min=%d", 
+			festate->cdr_columns_count, festate->min_fields);
 
+	/* reset record counter */
 	festate->recnum = 0;
-	festate->cdr_columns_count = 0;
 
 	/* get list of files */
 	enumerateFiles( festate );
@@ -638,7 +674,7 @@ moveToNextFile(MultiCdrExecutionState *festate)
 	}
 
 	/* open a file */
-	festate->source = multicdr_open( lfirst(festate->current_file), MULTICDR_FDW_OPEN_FLAGS);
+	festate->source = open( lfirst(festate->current_file), MULTICDR_FDW_OPEN_FLAGS);
 	if (festate->source == -1)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
@@ -668,6 +704,8 @@ endScan(MultiCdrExecutionState *festate)
 			pfree(festate->fields_end);
 		if (festate->map_fields)
 			pfree(festate->map_fields);
+		if (festate->pos_fields)
+			pfree(festate->pos_fields);
 
 		festate->current_file = NULL;
 		if (festate->files)
@@ -877,11 +915,19 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 	return bytes_read > 0;
 }
 
+/*
+ * Fetches a next CDR line
+ * Returns false if fatal read error happens or if all files have been read
+ * Function handles file switching internally
+ */
 static bool
 fetchLine(MultiCdrExecutionState *festate)
 {
 	if (fetchLineFromFile(festate))
+	{
+		++festate->cdr_row;
 		return true;
+	}
 
 	elog(MULTICDR_FDW_TRACE_LEVEL, "fetch line failed, total read %d lines, move to next file", festate->cdr_row);
 	/* eof */
@@ -937,101 +983,67 @@ parseIntArray(char *string, int **vals)
 }
 
 /* 
- * Count cdr fields in the line
- * Fields are delimited by couple of spaces
+ * Parse a line by field positions and store begin-end pairs 
+ * Returns true if a line contains exact needed fields amount
  */
-static int
-parseLine(char* read_buf, char **fields_start, char **fields_end, int max_fields)
+static bool
+parseLine(MultiCdrExecutionState *festate)
 {
-	int	cdr_columns;
+	int	cur_column;
 	char *start, *end;
-	char  *p, *string_end;
+	char *string_end;
 
-	p = read_buf;
-	string_end = read_buf + strlen(read_buf);
+	string_end = festate->read_buf + strlen(festate->read_buf);
 
-	/* count all cdr fields*/
-
-	cdr_columns = 0;
-	for (;;)
+	if (festate->read_buf + festate->pos_fields[festate->pos_fields_count-1] >= string_end)
 	{
-		for (start = p; start && start != string_end && *start == ' '; ++start)
-			;
-		for (end = start; end && end != string_end && *end != ' '; ++end)
-			;
-
-		if (start == end)
-			break;
-
-		if (max_fields && cdr_columns >= max_fields)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					errmsg("column %d is out of range %d", cdr_columns, max_fields)));
-		}
-
-		if (fields_start)
-			fields_start[cdr_columns] = start;
-		if (fields_end)
-			fields_end[cdr_columns] = end;
-
-		p = end;
-		++cdr_columns;
+		elog(MULTICDR_FDW_TRACE_LEVEL, "Skipping special row %d", festate->cdr_row);
+		return false;
 	}
 
-	return cdr_columns;
+	for (cur_column = 0; cur_column < festate->cdr_columns_count; ++cur_column)
+	{
+		start = festate->pos_fields[cur_column] + festate->read_buf;
+		if (cur_column == festate->cdr_columns_count - 1)
+			end = string_end;
+		else
+			end = festate->pos_fields[cur_column+1] + festate->read_buf;
+
+		/* don't skip spaces at beginning, it's a sign of a bad CDR line
+		 * for (; start != end && *start == ' '; ++start)
+			;*/
+		for (; start != end && *(end-1) == ' '; --end)
+			;
+
+		if (start == end || *start == ' ')
+		{
+			ereport(MULTICDR_FDW_TRACE_LEVEL,
+					(errcode(ERRCODE_NO_DATA_FOUND),
+					 errmsg("Empty column found at CDR row %d and field %d", festate->cdr_row, cur_column)));
+			return false;
+		}
+
+		festate->fields_start[cur_column] = start;
+		festate->fields_end[cur_column] = end;
+	}
+	
+	return true;
 }
-
-
 
 /*
  * Rewind buffer to a good sized CDR row
- * Post-condition: read_buf contains good cdr line with `cdr_columns_count` columns
+ * Post-condition: read_buf contains good cdr line 
  * Returns true if ok, false if EOF
- * Note: cdr_row is 1-based
  */
 static bool 
 rewindToCdrLine(MultiCdrExecutionState *festate)
 {
-	int	cdr_columns;
-	int i;
-
-	for (;;)
+	do
 	{
 		if (!fetchLine(festate))
 			return false;
 	
-		++festate->cdr_row;
-		
-		cdr_columns = parseLine(festate->read_buf, NULL, NULL, 0);
-
-		/* save real columns count */
-		if (cdr_columns >= festate->min_fields && festate->cdr_columns_count == 0)
-		{
-			elog(MULTICDR_FDW_TRACE_LEVEL, "detected CDR columns count %d with min=%d", cdr_columns, festate->min_fields);
-			festate->cdr_columns_count = cdr_columns;
-			festate->fields_start = repalloc(festate->fields_start, festate->cdr_columns_count * sizeof(char*));
-			festate->fields_end = repalloc(festate->fields_end, festate->cdr_columns_count * sizeof(char*));
-
-			/* verify that a mapping is feasible */
-			for (i = 0; i < festate->map_fields_count; ++i)
-			{
-				if (festate->map_fields[i] < 0 || festate->map_fields[i] >= festate->cdr_columns_count)
-				{
-					ereport(ERROR,
-							(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-							 errmsg("can't map field #%d to CDR field #%d", i, festate->map_fields[i])));
-				}
-			}
-		}
-
-		/* column with a good column count */
-		if (festate->cdr_columns_count == cdr_columns)
-			break;
-		
-		/*elog(WARNING, "skip row %d with %d columns (instead of %d)",
-				festate->cdr_row, cdr_columns, festate->cdr_columns_count );*/
-	}
+	} while (!parseLine(festate));
 
 	return true;
 }
@@ -1047,9 +1059,7 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 
 	if (!rewindToCdrLine(festate))
 		return false;
-	
-	parseLine(festate->read_buf, festate->fields_start, festate->fields_end, festate->cdr_columns_count);
-	
+
 	for (column = 0; column < festate->relation_columns_count; ++column)
 	{
 		/* save a current filename if asked */
@@ -1066,16 +1076,12 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 
 			/*elog(MULTICDR_FDW_TRACE_LEVEL, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
 
-			slot->tts_isnull[column] = start == end;
-			if (start == end)
-			{
-				/* precaution, should never happens because it's a good line there can't be empty columns */
-				slot->tts_values[column] = PointerGetDatum(NULL);
-			}
-			else
+			/* check is a precaution, should never happens because if it's a good line there can't be empty columns */
+			if (start != end)
 			{
 				temp = pnstrdup(start, end-start);
 				conv = pg_any_to_server(temp, end-start, festate->encoding);
+				slot->tts_isnull[column] = false;
 				slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
 				pfree(temp);
 			}
