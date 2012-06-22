@@ -59,10 +59,6 @@ static struct MultiCdrFdwOption valid_options[] = {
 	{"posfields", ForeignTableRelationId},
 	{"mapfields", ForeignTableRelationId},
 	{"filefield", ForeignTableRelationId},
-	{"minfields", ForeignTableRelationId},
-
-	/* it's like COPY's encoding */
-	{"encoding", ForeignTableRelationId},
 
 	/* Sentinel */
 	{NULL, InvalidOid}
@@ -78,12 +74,10 @@ typedef struct MultiCdrExecutionState
 	regex_t	pattern_regex;
 	char		*file_field;
 	int			file_field_column;
-	int			encoding;
 	int			*pos_fields;
 	int			pos_fields_count;
 	int			*map_fields;
 	int			map_fields_count;
-	int			min_fields;
 	
 	/* context */
 	char	*read_buf;
@@ -192,11 +186,9 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 	List    *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid		catalog = PG_GETARG_OID(1);
 	char *directory = NULL, *pattern = NULL, *file_field = NULL, 
-				*map_fields_str = NULL, *pos_fields_str = NULL, *min_fields_str = NULL,
-				*encoding = NULL;
+				*map_fields_str = NULL, *pos_fields_str = NULL;
 	int *map_fields, *pos_fields;
 	int map_fields_count, pos_fields_count;
-	int min_fields;
 	ListCell   *cell;
 
 	/*
@@ -304,31 +296,6 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			if (pos_fields)
 				pfree(pos_fields);
 		}
-		else if (strcmp(def->defname, "minfields") == 0)
-		{
-			if (min_fields_str)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-				    	errmsg("conflicting or redundant options")));
-			min_fields_str = defGetString(def);
-			min_fields = strtol(min_fields_str, NULL, 10);
-			if (min_fields <= 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-				    	errmsg("invalid minimum CDR fields number '%s'", min_fields)));
-		}
-		else if (strcmp(def->defname, "encoding") == 0)
-		{
-			if (encoding)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-				    	errmsg("conflicting or redundant options")));
-			encoding = defGetString(def);
-			if (pg_char_to_encoding(encoding) == -1)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-				    	errmsg("invalid encoding name '%s'", encoding)));
-		}
 	}
 	
 	/*
@@ -352,14 +319,6 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
 			    	errmsg("mapfields is required for multicdr_fdw foreign tables")));
-		if (min_fields_str == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-			    	errmsg("mapfields is required for multicdr_fdw foreign tables")));
-		if (encoding == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-			    	errmsg("encoding is required for multicdr_fdw foreign tables")));
 	}
 
 	PG_RETURN_VOID();
@@ -427,15 +386,10 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	options = list_concat(options, server->options);
 	options = list_concat(options, table->options);
 
-	state->files = NIL;
-
 	/*
 	 * Read options
 	 */
-	state->directory = state->file_field = NULL;
-	state->map_fields = NULL;
-	state->encoding = state->map_fields_count = 0;
-	state->min_fields = 0;
+	MemSet(state, 0, sizeof(MultiCdrExecutionState));
 	foreach(lc, options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
@@ -470,14 +424,6 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		else if (strcmp(def->defname, "mapfields") == 0)
 		{
 			state->map_fields_count = parseIntArray(defGetString(def), &state->map_fields);
-		}
-		else if (strcmp(def->defname, "minfields") == 0)
-		{
-			state->min_fields = strtol(defGetString(def), NULL, 10);
-		}
-		else if (strcmp(def->defname, "encoding") == 0)
-		{
-			state->encoding = pg_char_to_encoding(defGetString(def));
 		}
 	}
 
@@ -633,8 +579,14 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 					 errmsg("can't map field #%d to CDR field #%d", i, festate->map_fields[i])));
 		}
 	}
-	elog(MULTICDR_FDW_TRACE_LEVEL, "detected CDR columns count %d with min=%d", 
-			festate->cdr_columns_count, festate->min_fields);
+
+	/* fields mapping must agree to a relation dim */
+	if (festate->map_fields_count != 0 && festate->map_fields_count != festate->relation_columns_count)
+	{
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("Fields mapping and relation dimensions must agree (%d vs %d)", festate->map_fields_count, festate->relation_columns_count)));
+	}
 
 	/* reset record counter */
 	festate->recnum = 0;
@@ -1080,7 +1032,7 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 			if (start != end)
 			{
 				temp = pnstrdup(start, end-start);
-				conv = pg_any_to_server(temp, end-start, festate->encoding);
+				conv = pg_any_to_server(temp, end-start, PG_LATIN1);
 				slot->tts_isnull[column] = false;
 				slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
 				pfree(temp);

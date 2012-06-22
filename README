@@ -13,9 +13,9 @@ In a few words extension, foreign data server and foreign table
 must be created with a superuser permission. Then a user with 
 appropriate permissions can select CDR data from a table.
 
-CDR file consists of multiple rows. Each row contains space-delimited
-data entries. Some special rows could be ignored if they contains
-not enough columns.
+CDR file consists of multiple rows. Each row contains data fields at
+fixed positions. List of positions is specified when table is created.
+Some special rows are ignored if they contains not enough columns.
 
 Options
 -------------------
@@ -30,17 +30,14 @@ Posix Extended regex for selecting a file path.
 Specifies a mapping from table columns to a CDR fields. For example, "4,5,6"
 says that fourth, fifth and sixth fields from each CDR row will be read to a
 table. An array and a table must have equal dimensions.
-Fields will be mapped sequentially if mapfields is not specified.
+Fields are mapped sequentially if mapfields is not specified.
 
-* minfields. Text with a integer, mandatory.
-Minimal fields count for a valid CDR row.
-
-* encoding. Text, mandatory.
-Encoding of files.
+* posfields. Text array with a comma-separated integers, mandatory.
+Specified positions in chars where each CDR field is started. Fields are
+always left-aligned so a position should point to the non-space.
 
 * filefield. Text, optional.
 Name of the column that should contain a row's file path.
-
 
 Building
 -------------------
@@ -73,5 +70,4 @@ CREATE FOREIGN TABLE multicdr_test_table (
 	directory '/opt/pool',
 	pattern '.*\.cdr',
 	mapfields '3,4,5,0,1',
-	minfields '5',
-	encoding 'UTF-8');
+	posfields '0,6,15,40,50,71,92');
