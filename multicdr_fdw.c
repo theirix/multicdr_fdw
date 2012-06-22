@@ -237,8 +237,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 			    	errmsg("invalid option \"%s\"", def->defname),
-			    	errhint("Valid options in this context are: %s",
-					    buf.data)));
+			    	errhint("Valid options in this context are: %s", buf.data)));
 		}
 
 		/* Separate out own options, since ProcessCopyOptions won't allow it */
@@ -277,7 +276,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			if (map_fields == NULL && map_fields_count != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-				    	errmsg("invalid map fields")));
+				    	errmsg("invalid fields mapping")));
 			if (map_fields)
 				pfree(map_fields);
 		}
@@ -292,7 +291,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 			if (pos_fields == NULL || pos_fields_count <= 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-				    	errmsg("invalid map fields")));
+				    	errmsg("invalid fields mapping")));
 			if (pos_fields)
 				pfree(pos_fields);
 		}
@@ -306,19 +305,19 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 		if (directory == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-			    	errmsg("directory is required for multicdr_fdw foreign tables")));
+			    	errmsg("directory is required for foreign table")));
 		if (pattern == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-			    	errmsg("pattern is required for multicdr_fdw foreign tables")));
+			    	errmsg("pattern is required for foreign table")));
 		if (pos_fields_str == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-			    	errmsg("mapfields is required for multicdr_fdw foreign tables")));
+			    	errmsg("mapfields is required for foreign table")));
 		if (map_fields_str == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-			    	errmsg("mapfields is required for multicdr_fdw foreign tables")));
+			    	errmsg("mapfields is required for foreign table")));
 	}
 
 	PG_RETURN_VOID();
@@ -487,8 +486,8 @@ enumerateFiles (MultiCdrExecutionState *festate)
 	if (!dir)
 	{
 		ereport(ERROR,
-				(errcode(ERRCODE_NO_DATA_FOUND),
-		    errmsg("no directory found %s", dir)));
+				(errcode_for_file_access(),
+		    errmsg("can't open directory \"%s\": %m", dir)));
 		return -1;
 	}
 
@@ -501,8 +500,8 @@ enumerateFiles (MultiCdrExecutionState *festate)
 		if (stat( path, &file_stat ))
 		{
 			ereport(ERROR,
-					(errcode(ERRCODE_NO_DATA_FOUND),
-			    errmsg("can't retrieve file information %s", path)));
+					(errcode_for_file_access(),
+			    errmsg("can't retrieve file information for \"%s\"", path)));
 			closedir( dir );
 			return -1;
 		}
@@ -514,7 +513,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 			err = pg_regexec(&festate->pattern_regex, wpath, pg_wchar_strlen(wpath), 0, NULL, 0, NULL, 0);
 			if (err)
 			{
-				elog(MULTICDR_FDW_TRACE_LEVEL, "skip unmatched file %s", path);
+				elog(MULTICDR_FDW_TRACE_LEVEL, "skip unmatched file \"%s\"", path);
 			}
 			else
 			{
@@ -547,7 +546,10 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 				festate->file_field_column = i;
 		}
 	}
-	elog(MULTICDR_FDW_TRACE_LEVEL, "Field with a filename: %d", festate->file_field_column);
+	if (festate->file_field_column != -1)
+	{
+		elog(MULTICDR_FDW_TRACE_LEVEL, "use column %d for a filename", festate->file_field_column);
+	}
 
 	/* if none provided, create default mapping - one-to-one for existing fields */
 	if (festate->map_fields_count == 0)
@@ -585,7 +587,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	{
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("Fields mapping and relation dimensions must agree (%d vs %d)", festate->map_fields_count, festate->relation_columns_count)));
+					 errmsg("mapping and relation dimensions must agree (%d vs %d)", festate->map_fields_count, festate->relation_columns_count)));
 	}
 
 	/* reset record counter */
@@ -596,7 +598,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 
 	foreach (cell, festate->files)
 	{
-		elog(MULTICDR_FDW_TRACE_LEVEL, "found file: %s", (char*)lfirst(cell));
+		elog(MULTICDR_FDW_TRACE_LEVEL, "found file: \"%s\"", (char*)lfirst(cell));
 	}
 
 	moveToNextFile(festate);
@@ -629,8 +631,8 @@ moveToNextFile(MultiCdrExecutionState *festate)
 	festate->source = open( lfirst(festate->current_file), MULTICDR_FDW_OPEN_FLAGS);
 	if (festate->source == -1)
 		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-				errmsg("unable to open file")));
+				(errcode_for_file_access(),
+				errmsg("unable to open file \"%s\": %m", lfirst(festate->current_file))));
 
 	/* reset counters and file-specific data */
 	festate->cdr_row = 0;
@@ -705,7 +707,7 @@ fileErrorCallback(void *arg)
 	char* fn;
 
 	fn = festate->current_file ? lfirst(festate->current_file) : "<none>";
-	errcontext("MultiCDR Foreign Table filename: '%s' record: %d", fn, festate->recnum);
+	errcontext("MultiCDR Foreign Table filename: \"%s\" record: %d", fn, festate->recnum);
 }
 
 /*
@@ -782,7 +784,7 @@ fetchFileData(MultiCdrExecutionState *festate)
 	{
 		ereport(ERROR,
 			(errcode_for_file_access(),
-	    errmsg("error reading from external data file %s", lfirst(festate->current_file))));
+	    errmsg("can't read from data file %s", lfirst(festate->current_file))));
 		return false;
 	}
 	festate->file_buf_start = festate->file_buf;
@@ -916,7 +918,7 @@ parseIntArray(char *string, int **vals)
 		if (end == start)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-			    errmsg("illegal string")));
+			    errmsg("can't parse array")));
 		(*vals)[count] = result;
 		while (*end == ' ')
 			++end;
@@ -925,7 +927,7 @@ parseIntArray(char *string, int **vals)
 		if (*end != ',')
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-			    	errmsg("illegal string")));
+			    	errmsg("can't parse array")));
 		start = end + 1;
 		if (count >= initial_count)
 			*vals = repalloc(*vals, count * 1.4 * sizeof(int));
@@ -971,7 +973,7 @@ parseLine(MultiCdrExecutionState *festate)
 		{
 			ereport(MULTICDR_FDW_TRACE_LEVEL,
 					(errcode(ERRCODE_NO_DATA_FOUND),
-					 errmsg("Empty column found at CDR row %d and field %d", festate->cdr_row, cur_column)));
+					 errmsg("skipping CDR row %d with empty field %d", festate->cdr_row, cur_column)));
 			return false;
 		}
 
