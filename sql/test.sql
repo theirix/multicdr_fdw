@@ -9,15 +9,15 @@ GRANT USAGE ON FOREIGN SERVER multicdr_fdw_server TO testuser;
 
 CREATE FOREIGN TABLE multicdr_test_table (
     field1 text,
-    field2 text,
+    field2 integer,
     field3 text,
-    field4 text,
+    field4 integer,
     field5 text,
     field6 text,
     field7 text,
     field8 text,
     field9 text,
-    field10 text
+    field10 integer
 ) SERVER multicdr_fdw_server
 OPTIONS (
 	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/set1', 

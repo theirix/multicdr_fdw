@@ -70,41 +70,45 @@ static struct MultiCdrFdwOption valid_options[] = {
 typedef struct MultiCdrExecutionState
 {
 	/* parameters */
-	char		*directory;		/* directory to read */
-	regex_t	pattern_regex;
-	char		*file_field;
-	int			file_field_column;
-	int			*pos_fields;
-	int			pos_fields_count;
-	int			*map_fields;
-	int			map_fields_count;
+	char		*directory;					/* directory to read */
+	regex_t	pattern_regex;			/* file path regex */
+	char		*file_field;				/* name of field to write a filename */
+	int			file_field_column;	/* column number for a file_field */
+	int			*pos_fields;				/* array for posfields option */
+	int			pos_fields_count;		/* array size for posfields option */
+	int			*map_fields;				/* array for mapfields option */
+	int			map_fields_count;		/* array size for mapfields option */
+	Oid			*column_types;			/* types of columns */
 	
 	/* context */
-	char	*read_buf;
-	int		read_buf_size;
-	int		recnum;
-	int		cdr_row;
-	int		cdr_columns_count;
-	int		relation_columns_count;
+	char	*read_buf;							/* null-terminated buffer for a whole CDR line */
+	int		read_buf_size;					/* current read_buf size */
+	int		recnum;									/* current record number */
+	int		cdr_row;								/* row number of a current file */
+	int		cdr_columns_count;			/* fields count in a normal CDR row */
+	int		relation_columns_count;	/* relation size */
 
-	char	**fields_start;	
-	char	**fields_end;		
+	char	**fields_start;					/* start pointer inside read_buf array for each CDR field */
+	char	**fields_end;						/* end pointer inside read_buf array for each CDR field */
 
 	/* file I/O */
-	int		source;
-	char	*file_buf;
-	char	*file_buf_start;
-	char	*file_buf_end;
+	int		source;									/* current file descriptor */
+	char	*file_buf;							/* file read buffer */
+	char	*file_buf_start;				/* start pointer of actual data in file_buf */
+	char	*file_buf_end;					/* end potiner of actual data in file_buf */
 
-	List		*files;
-	ListCell *current_file;
+	List		*files;								/* list of all valid files */
+	ListCell *current_file;				/* current file */
+
 } MultiCdrExecutionState;
 
+/* initial read_buf size */
 #define MULTICDR_FDW_INITIAL_BUF_SIZE 128
+
+/* initial file_buf size */
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
-#define MULTICDR_FDW_OPEN_FLAGS O_RDONLY 
-
+/* log level, usually DEBUG5 (silent) or NOTICE (messages are sent to client side) */
 #define MULTICDR_FDW_TRACE_LEVEL DEBUG5
 
 /*
@@ -150,6 +154,8 @@ static bool
 parseLine(MultiCdrExecutionState *festate);
 static int
 parseIntArray(char *string, int **vals);
+static long
+safe_strtol (const char* text);
 static bool
 moveToNextFile(MultiCdrExecutionState *festate);
 
@@ -535,6 +541,18 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 
 	festate->relation_columns_count = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
 
+	/* save columns types */
+	festate->column_types = palloc(festate->relation_columns_count * sizeof(Oid));
+	for (i = 0; i < festate->relation_columns_count; ++i)
+	{
+		festate->column_types[i] = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->attrs[i]->atttypid;
+		if (!(festate->column_types[i] == TEXTOID || festate->column_types[i] == INT4OID))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+					 errmsg("invalid column type %d, allowed integer or text only", festate->column_types[i])));
+		}
+	}
 
 	/* find a column with filename, may be -1 if none specified */
 	festate->file_field_column = -1;
@@ -628,7 +646,7 @@ moveToNextFile(MultiCdrExecutionState *festate)
 	}
 
 	/* open a file */
-	festate->source = open( lfirst(festate->current_file), MULTICDR_FDW_OPEN_FLAGS);
+	festate->source = open( lfirst(festate->current_file), O_RDONLY);
 	if (festate->source == -1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -660,6 +678,8 @@ endScan(MultiCdrExecutionState *festate)
 			pfree(festate->map_fields);
 		if (festate->pos_fields)
 			pfree(festate->pos_fields);
+		if (festate->column_types)
+			pfree(festate->column_types);
 
 		festate->current_file = NULL;
 		if (festate->files)
@@ -936,6 +956,21 @@ parseIntArray(char *string, int **vals)
 	return count+1;
 }
 
+static long
+safe_strtol (const char* text)
+{
+	long intval;
+	char *endptr;
+	intval = strtol(text, &endptr, 10);
+	if (endptr != text + strlen(text))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("wrong string treated as a number: %s", text)));
+	}
+	return intval;
+}
+
 /* 
  * Parse a line by field positions and store begin-end pairs 
  * Returns true if a line contains exact needed fields amount
@@ -1034,9 +1069,21 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 			if (start != end)
 			{
 				temp = pnstrdup(start, end-start);
-				conv = pg_any_to_server(temp, end-start, PG_LATIN1);
 				slot->tts_isnull[column] = false;
-				slot->tts_values[column] = PointerGetDatum(cstring_to_text(conv));
+				switch (festate->column_types[column])
+				{
+					case INT4OID:
+						slot->tts_values[column] = Int32GetDatum(safe_strtol(temp));
+						break;
+
+					case TEXTOID:
+						conv = pg_any_to_server(temp, end-start, PG_LATIN1);
+						slot->tts_values[column] = CStringGetTextDatum(conv);
+						break;
+
+					default:
+						slot->tts_isnull[column] = true;
+				}
 				pfree(temp);
 			}
 		}
@@ -1060,7 +1107,7 @@ fileEndForeignScan(ForeignScanState *node)
 
 /*
  * fileReScanForeignScan
- *		Rescan table, possibly with new parameters
+ * Rescan table, possibly with new parameters
  */
 static void
 fileReScanForeignScan(ForeignScanState *node)
@@ -1073,77 +1120,14 @@ fileReScanForeignScan(ForeignScanState *node)
 
 /*
  * Estimate costs of scanning a foreign table.
+ * Actually we can't provide any estimation because estimation itself
+ * is very resourse-hungry
  */
 static void
 estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 		MultiCdrExecutionState *state,
 		Cost *startup_cost, Cost *total_cost)
 {
-/*	struct stat stat_buf;
-	BlockNumber pages;
-	int		tuple_width;
-	double	ntuples;
-	double	nrows;
-	Cost	run_cost = 0;
-	Cost	cpu_per_tuple;*/
-
-#if 0
-	/*
-	 * Get size of the file.  It might not be there at plan time, though, in
-	 * which case we have to use a default estimate.
-	 */
-	if (stat(filename, &stat_buf) < 0)
-		stat_buf.st_size = 10 * BLCKSZ;
-
-	/*
-	 * Convert size to pages for use in I/O cost estimate below.
-	 */
-	pages = (stat_buf.st_size + (BLCKSZ - 1)) / BLCKSZ;
-	if (pages < 1)
-		pages = 1;
-
-	/*
-	 * Estimate the number of tuples in the file.  We back into this estimate
-	 * using the planner's idea of the relation width; which is bogus if not
-	 * all columns are being read, not to mention that the text representation
-	 * of a row probably isn't the same size as its internal representation.
-	 * FIXME later.
-	 */
-	tuple_width = MAXALIGN(baserel->width) + MAXALIGN(sizeof(HeapTupleHeaderData));
-
-	ntuples = clamp_row_est((double) stat_buf.st_size / (double) tuple_width);
-
-	/*
-	 * Now estimate the number of rows returned by the scan after applying the
-	 * baserestrictinfo quals.	This is pretty bogus too, since the planner
-	 * will have no stats about the relation, but it's better than nothing.
-	 */
-	nrows = ntuples *
-		clauselist_selectivity(root,
-							   baserel->baserestrictinfo,
-							   0,
-							   JOIN_INNER,
-							   NULL);
-
-	nrows = clamp_row_est(nrows);
-
-	/* Save the output-rows estimate for the planner */
-	baserel->rows = nrows;
-
-	/*
-	 * Now estimate costs.	We estimate costs almost the same way as
-	 * cost_seqscan(), thus assuming that I/O costs are equivalent to a
-	 * regular table file of the same size.  However, we take per-tuple CPU
-	 * costs as 10x of a seqscan, to account for the cost of parsing records.
-	 */
-	run_cost += seq_page_cost * pages;
-
-	*startup_cost = baserel->baserestrictcost.startup;
-	cpu_per_tuple = cpu_tuple_cost * 10 + baserel->baserestrictcost.per_tuple;
-	run_cost += cpu_per_tuple * ntuples;
-	*total_cost = *startup_cost + run_cost;
-#endif
-
 	*startup_cost = baserel->baserestrictcost.startup;
 	*total_cost = *startup_cost * 10;
 	baserel->rows = 1;

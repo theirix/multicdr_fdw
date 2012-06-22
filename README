@@ -17,6 +17,9 @@ CDR file consists of multiple rows. Each row contains data fields at
 fixed positions. List of positions is specified when table is created.
 Some special rows are ignored if they contains not enough columns.
 
+Now only integer (int32) and text column types are allowed. 
+Please check fields for overflow.
+
 Options
 -------------------
 
