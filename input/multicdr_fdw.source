@@ -67,7 +67,7 @@ OPTIONS (directory '@abs_srcdir@/data/regression9000', pattern '.*\.cdr$', posfi
 -- basic query tests
 SELECT * FROM tbl_alpha ORDER BY f4;
 SELECT * FROM tbl_beta WHERE f4 < 5 AND f2 < 7 ORDER BY f5;
-SELECT * FROM tbl_alpha c JOIN tbl_beta t ON (t.f2 = c.f2) ORDER BY c.f4; -- TODO FIXME 
+SELECT * FROM tbl_alpha c JOIN tbl_beta t ON (t.f2 = c.f2) WHERE c.f4 < 100 AND t.f4 < 50;
 
 -- rows count
 \t on

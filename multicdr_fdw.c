@@ -572,6 +572,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	/* if none provided, create default mapping - one-to-one for existing fields */
 	if (festate->map_fields_count == 0)
 	{
+		elog(MULTICDR_FDW_TRACE_LEVEL, "using default one-to-one mapping for %d columns", festate->relation_columns_count);
 		festate->map_fields_count = festate->relation_columns_count;
 		festate->map_fields = palloc(festate->map_fields_count * sizeof(int));
 		for (i = 0; i < festate->map_fields_count; ++i)
@@ -675,10 +676,6 @@ endScan(MultiCdrExecutionState *festate)
 			pfree(festate->fields_start);
 		if (festate->fields_end)
 			pfree(festate->fields_end);
-		if (festate->map_fields)
-			pfree(festate->map_fields);
-		if (festate->pos_fields)
-			pfree(festate->pos_fields);
 		if (festate->column_types)
 			pfree(festate->column_types);
 
@@ -693,7 +690,22 @@ endScan(MultiCdrExecutionState *festate)
 			close(festate->source);
 			festate->source = 0;
 		}
+	}
+}
+
+static void
+freeOptions(MultiCdrExecutionState *festate)
+{
+	elog(MULTICDR_FDW_TRACE_LEVEL, "freeOptions");
+		
+	if (festate)
+	{
 		pg_regfree(&festate->pattern_regex);
+
+		if (festate->map_fields)
+			pfree(festate->map_fields);
+		if (festate->pos_fields)
+			pfree(festate->pos_fields);
 	}
 }
 
@@ -1104,6 +1116,7 @@ fileEndForeignScan(ForeignScanState *node)
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
 
 	endScan( festate );
+	freeOptions( festate );
 }
 
 /*
@@ -1114,6 +1127,8 @@ static void
 fileReScanForeignScan(ForeignScanState *node)
 {
 	MultiCdrExecutionState *festate = (MultiCdrExecutionState *) node->fdw_state;
+	
+	elog(MULTICDR_FDW_TRACE_LEVEL, "rescan initiated");
 
 	endScan( festate );
 	beginScan( festate, node );
