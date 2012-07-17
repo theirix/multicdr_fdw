@@ -42,18 +42,29 @@ always left-aligned so a position should point to the non-space.
 * filefield. Text, optional.
 Name of the column that should contain a row's file path.
 
-Building
--------------------
+Building and installing from source
+--------------------------------------
+
+Assume you are a current postgres user.
 
 1. Install a postgres 9.1 or newer
 2. Build an extension
-		make PG_CONFIG=/usr/local/postgre91/bin/pg_config clean all install
+		gmake PG_CONFIG=/usr/local/postgre91/bin/pg_config clean all install
+3. Restart a server
+4. Create extension, foreign server and table 
+5. Optionally, run tests
+		gmake PG_CONFIG=/usr/local/postgre91/bin/pg_config installcheck
+
+Installing from prebuilt version
+--------------------------------------
+
+1. Copy multicdr_fdw.so to POSTGRES_DIR/lib/postgresql/
+2. Copy multicdr_fdw.control and multicdr_fdw--1.0.sql to POSTGRES_DIR/share/postgresql/extension/
 3. Restart a server
 4. Create extension, foreign server and table
-5. Optionally, run make installcheck
 
 Example initialization sql script
--------------------
+--------------------------------------
 
 -- Should be run by a superuser
 
@@ -65,11 +76,11 @@ DROP SERVER IF EXISTS multicdr_fdw_server;
 CREATE SERVER multicdr_fdw_server FOREIGN DATA WRAPPER multicdr_fdw;
 
 CREATE FOREIGN TABLE multicdr_test_table (
-    field1 text,
-    field2 text,
-    field3 text,
-    field4 text,
-    field5 text,
+	field1 text,
+	field2 text,
+	field3 text,
+	field4 text,
+	field5 text,
 ) SERVER multicdr_fdw_server OPTIONS (
 	directory '/opt/pool',
 	pattern '.*\.cdr',
