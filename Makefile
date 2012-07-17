@@ -8,7 +8,6 @@ REGRESS_OPTS = --user postgres
 
 EXTRA_CLEAN = sql/multicdr_fdw.sql expected/multicdr_fdw.out
 
-PG_CPPFLAGS = -Wno-format
-#PG_CPPFLAGS += -g -O0
+#PG_CPPFLAGS += -Wno-format -g -O0
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
