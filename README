@@ -49,19 +49,23 @@ Assume you are a current postgres user.
 
 1. Install a postgres 9.1 or newer
 2. Build an extension
-		gmake PG_CONFIG=/usr/local/postgre91/bin/pg_config clean all install
+		gmake PG_CONFIG=$POSTGRES_DIR/bin/pg_config clean all install
 3. Restart a server
 4. Create extension, foreign server and table 
 5. Optionally, run tests
-		gmake PG_CONFIG=/usr/local/postgre91/bin/pg_config installcheck
+		gmake PG_CONFIG=$POSTGRES_DIR/bin/pg_config installcheck
+
+NOTE: path to the pg_config could be $POSTGRES_DIR/bin/64/pg_config for 64-bit systems
 
 Installing from prebuilt version
 --------------------------------------
 
-1. Copy multicdr_fdw.so to POSTGRES_DIR/lib/postgresql/
-2. Copy multicdr_fdw.control and multicdr_fdw--1.0.sql to POSTGRES_DIR/share/postgresql/extension/
+1. Copy multicdr_fdw.so to the pkglibdir dir. Consult with `$POSTGRES_DIR/bin/pg_config --pkglibdir` 
+2. Copy multicdr_fdw.control and multicdr_fdw--1.0.sql to extension dir. Consult with `$POSTGRES_DIR/bin/pg_config --sharedir`/extension
 3. Restart a server
 4. Create extension, foreign server and table
+
+NOTE: path to the pg_config could be $POSTGRES_DIR/bin/64/pg_config for 64-bit systems
 
 Example initialization sql script
 --------------------------------------
@@ -80,7 +84,7 @@ CREATE FOREIGN TABLE multicdr_test_table (
 	field2 text,
 	field3 text,
 	field4 text,
-	field5 text,
+	field5 text
 ) SERVER multicdr_fdw_server OPTIONS (
 	directory '/opt/pool',
 	pattern '.*\.cdr',
