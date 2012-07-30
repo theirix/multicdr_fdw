@@ -36,8 +36,15 @@ CREATE USER MAPPING FOR file_fdw_superuser SERVER file_server;
 CREATE USER MAPPING FOR no_priv_user SERVER file_server;
 
 -- validator tests
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo');
+DROP FOREIGN TABLE IF EXISTS tbl;
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory '');      -- ERROR
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory '', pattern '', mapfields '');      -- ERROR
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', pattern '');
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', pattern '', mapfields '');
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', pattern '', mapfields '', posfields '');
+DROP FOREIGN TABLE IF EXISTS tbl;
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (posfields '1,foo,2');          -- ERROR
 CREATE FOREIGN TABLE tbl () SERVER file_server;  -- ERROR
 

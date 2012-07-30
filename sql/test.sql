@@ -17,10 +17,16 @@ CREATE FOREIGN TABLE multicdr_test_table (
     field7 text,
     field8 text,
     field9 text,
-    field10 integer
+    field10 integer,
+
+		datemin TIMESTAMP,
+		datemax TIMESTAMP
 ) SERVER multicdr_fdw_server
 OPTIONS (
 	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/regression1', 
 	pattern '.*\.cdr$',
 	posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329',
-	mapfields '0,1,2,3,4,5,6,7,8,9');
+	mapfields '0,1,2,3,4,5,6,7,8,9',
+	dateminfield 'datemin',
+	datemaxfield 'datemax'
+);
