@@ -17,7 +17,6 @@
 #include <unistd.h>
 #include <dirent.h>
 
-
 #include "access/reloptions.h"
 #include "access/tupdesc.h"
 #include "catalog/pg_attribute.h"
@@ -28,7 +27,6 @@
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "executor/spi.h"
-#include "fmgr.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "mb/pg_wchar.h"
@@ -39,6 +37,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/formatting.h"
 #include "utils/timestamp.h"
 
 PG_MODULE_MAGIC;
@@ -80,22 +79,26 @@ static struct MultiCdrFdwOption valid_options[] = {
 typedef struct MultiCdrExecutionState
 {
 	/* parameters */
-	char		*directory;						/* directory to read */
-	regex_t	pattern_regex;				/* file path regex */
-	int			regex_date_group_num;	/* group number with a pattern containg a date */
-	char		*date_format;					/* date format */
-	char		*file_field;					/* name of field to write a filename */
-	char		*datemin_field;				/* name of field to write a min date */
-	char		*datemax_field;				/* name of field to write a max date */
-	int			file_field_column;		/* column number for a file_field */
-	int			datemin_field_column;	/* column number for a datemin */
-	int			datemax_field_column;	/* column number for a datemax */
-	int			*pos_fields;					/* array for posfields option */
-	int			pos_fields_count;			/* array size for posfields option */
-	int			*map_fields;					/* array for mapfields option */
-	int			map_fields_count;			/* array size for mapfields option */
-	Oid			*column_types;				/* types of columns */
-	List		*op_oids;							/* allowed operator oids */
+	char			*directory;						/* directory to read */
+	regex_t		pattern_regex;				/* file path regex */
+	int				regex_date_group_num;	/* group number with a pattern containg a date */
+	char			*date_format;					/* date format */
+
+	char			*file_field;					/* name of field to write a filename */
+	char			*datemin_field;				/* name of field to write a min date */
+	char			*datemax_field;				/* name of field to write a max date */
+	Timestamp	datemin_timestamp;		/* timestamp with min date */
+	Timestamp	datemax_timestamp;		/* timestamp with max date */
+	int				file_field_column;		/* column number for a file_field */
+	int				datemin_field_column;	/* column number for a datemin */
+	int				datemax_field_column;	/* column number for a datemax */
+
+	int				*pos_fields;					/* array for posfields option */
+	int				pos_fields_count;			/* array size for posfields option */
+	int				*map_fields;					/* array for mapfields option */
+	int				map_fields_count;			/* array size for mapfields option */
+	Oid				*column_types;				/* types of columns */
+	List			*op_oids;							/* allowed operator oids */
 	
 	/* context */
 	char	*read_buf;							/* null-terminated buffer for a whole CDR line */
@@ -154,7 +157,7 @@ static void fileEndForeignScan(ForeignScanState *node);
  */
 static void defGetStringOrNull(DefElem* def, char** field);
 static void defGetStringOrNullPrecheck(DefElem* def, char** field);
-static Timestamp parseTimestamp(const char *str);
+static Timestamp parseTimestamp(const char *str, const char *fmt);
 static bool is_valid_option(const char *option, Oid context);
 static pg_wchar* make_wchar_dup(const char *tstr);
 static char* regex_group_str(const char *str, const regmatch_t group);
@@ -401,14 +404,13 @@ defGetStringOrNullPrecheck(DefElem* def, char **field)
 }
 
 static Timestamp
-parseTimestamp(const char *str)
+parseTimestamp(const char *str, const char *fmt)
 {
   Datum timestamptz;
 	Datum ts;
-  /* format: yyyy-MM-dd HH:mm:ss */
-  timestamptz = OidFunctionCall2(F_TO_TIMESTAMP,
+  timestamptz = DirectFunctionCall2(to_timestamp,
       PointerGetDatum(cstring_to_text(str)),
-      PointerGetDatum(cstring_to_text("YYYY-MM-DD HH:MI:SS")));
+      PointerGetDatum(cstring_to_text(fmt)));
   Assert(timestamptz);
   ts = DirectFunctionCall1(timestamptz_timestamp,
       timestamptz);
@@ -628,6 +630,9 @@ enumerateFiles (MultiCdrExecutionState *festate)
 	int err;
 	pg_wchar *wpath;
 	bool should_pass = false;
+	regmatch_t groups[16];
+	char *file_date_str;
+	Timestamp file_timestamp;
 
 	festate->files = NIL;
 	festate->current_file = NULL;
@@ -670,7 +675,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 		{
 			wpath = make_wchar_dup(path);
 
-			err = pg_regexec(&festate->pattern_regex, wpath, pg_wchar_strlen(wpath), 0, NULL, 0, NULL, 0);
+			err = pg_regexec(&festate->pattern_regex, wpath, pg_wchar_strlen(wpath), 0, NULL, sizeof(groups)/sizeof(groups[0]), groups, 0);
 			if (err)
 			{
 				elog(MULTICDR_FDW_TRACE_LEVEL, "skip unmatched file \"%s\"", path);
@@ -678,15 +683,70 @@ enumerateFiles (MultiCdrExecutionState *festate)
 			}
 			pfree(wpath);
 		}
-
-		/* check for time restriction */
-		if (should_pass)
+			
+		if ((festate->date_format != NULL) != (festate->datemin_timestamp || festate->datemax_timestamp))
 		{
-			if (festate->datemin_field_column != -1)
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("dateformat and dateminfield/datemaxfield must be both specified")));
+		}
+
+		/* prepare check for time restriction */
+		if (should_pass && festate->date_format)
+		{
+			/* extract date from filename by specified regex */
+			if (festate->regex_date_group_num >= sizeof(groups)/sizeof(groups[0]))
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("regex group is out of range")));
+
+			file_date_str = regex_group_str(path, groups[festate->regex_date_group_num]);
+
+			elog(MULTICDR_FDW_TRACE_LEVEL, "date string is \"%s\", date format is \"%s\"", file_date_str, festate->date_format);
+
+			PG_TRY();
 			{
+				file_timestamp = parseTimestamp(file_date_str, festate->date_format);
+			}
+			PG_CATCH();
+			{
+				if (geterrcode() == ERRCODE_DATETIME_VALUE_OUT_OF_RANGE)
+				{
+					elog(MULTICDR_FDW_TRACE_LEVEL, "cannot parse date in a filename, skipping");
+					should_pass = false;
+				}
+				else
+				{
+					PG_RE_THROW();
+				}
+			}
+			PG_END_TRY();
+
+			elog(MULTICDR_FDW_TRACE_LEVEL, "timestamp of a file \"%s\" is %s", path, timestamp_to_str(file_timestamp));
+		}
+
+		/* check datemin */
+		if (should_pass && festate->date_format && festate->datemin_timestamp)
+		{
+			if (!DatumGetBool(DirectFunctionCall2(timestamp_ge, 
+							TimestampGetDatum(file_timestamp),
+							TimestampGetDatum(festate->datemin_timestamp)
+					)))
+			{
+				elog(MULTICDR_FDW_TRACE_LEVEL, "skip by datemin %s", timestamp_to_str(festate->datemin_timestamp));
+				should_pass = false;
 			}
 		}
 
+		/* check datemax */
+		if (should_pass && festate->date_format && festate->datemax_timestamp)
+		{
+			if (!DatumGetBool(DirectFunctionCall2(timestamp_le, 
+							TimestampGetDatum(file_timestamp),
+							TimestampGetDatum(festate->datemax_timestamp))))
+			{
+				elog(MULTICDR_FDW_TRACE_LEVEL, "skip by datemax %s", timestamp_to_str(festate->datemax_timestamp));
+				should_pass = false;
+			}
+		}
+
+		/* accept a file */
 		if (should_pass)
 		{
 			elog(MULTICDR_FDW_TRACE_LEVEL, "this is a file you are looking for, move along \"%s\"", path);
@@ -714,8 +774,8 @@ fetch_valid_operators_oid(List** oids)
 	{
 		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Cannot spi connect: (%d)", res)));
 	}
-	res	= SPI_execute("select o.oid from pg_operator o, pg_type t where"\
-				"(t.oid = o.oprleft or t.oid = o.oprright) and t.typname='timestamp' and o.oprname!='+' and o.oprname!='-'",
+	res	= SPI_execute("select o.oid from pg_operator o, pg_type t where "\
+				"(t.oid = o.oprleft or t.oid = o.oprright) and t.typname='timestamp' and o.oprname='=' and o.oprname!='+' and o.oprname!='-'",
 			true, 0);
 	if (res < 0)
 	{
@@ -751,19 +811,19 @@ oid_in_list (List* list, Oid oid)
 
 /* returns true if an expression is deleted */
 static bool
-extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, List *allowed_oids, char **desc)
+extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, List *allowed_oids, Timestamp *timestamp)
 {
 	OpExpr	   *op = (OpExpr *) node;
 	Node	   *left, *right, *tmp;
 	Index		varattno;
-	char	   *key, *val;
-	StringInfoData	buf;
+	char	   *key;
+
+	if (!timestamp)
+		ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND), errmsg("invalid pointer")));
+	*timestamp = DT_NOEND;
 
 	if (node == NULL)
 		return false;
-	if (!desc)
-		ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND), errmsg("invalid pointer")));
-	*desc = NULL;
 
 	if (IsA(node, OpExpr))
 	{
@@ -794,10 +854,8 @@ extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, L
 		key = NameStr(tupdesc->attrs[varattno - 1]->attname);
 		if (!strcmp(key, field_name))
 		{
-			initStringInfo(&buf);
-			val = (char*)timestamp_to_str(DatumGetTimestamp(((Const*)right)->constvalue));
-			appendStringInfo(&buf, "%s=%s", (unsigned char *) key, (unsigned char *) val);
-			*desc = buf.data;
+			elog(MULTICDR_FDW_TRACE_LEVEL, "Found node %s operation %d", key, op->opno);
+			*timestamp = DatumGetTimestamp(((Const*)right)->constvalue);
 			return true;
 		}
 		else
@@ -817,25 +875,28 @@ extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, L
 
 /* returns true if an expression is deleted */
 static bool
-handle_condition (ExprState *state, ScanState *ss, const char* field_name, List *allowed_oids)
+handle_condition (ExprState *state, ScanState *ss, const char* field_name, List *allowed_oids, Timestamp *timestamp)
 {
 	bool should_remove;
-	char *desc = NULL;
 	Node *node;
 
 	node = (Node*)state->expr;
 	
 	should_remove = extract_date_expression(node, ss->ss_currentRelation->rd_att, 
-			field_name, allowed_oids, &desc);
+			field_name, allowed_oids, timestamp);
 	if (should_remove)
 	{
 		/* remove restriction clause from qual (implicitly-ANDed qual conditions) */
 		ss->ps.qual = list_delete(ss->ps.qual, (void*) state);
 
 		elog(MULTICDR_FDW_TRACE_LEVEL, "found condition for field %s: %s", 
-				field_name, desc ? desc : "<null>");
+				field_name, *timestamp != DT_NOEND ? timestamp_to_str(*timestamp) : "<none>");
 
 		return true;
+	}
+	else
+	{
+		*timestamp = DT_NOEND;
 	}
 	return false;
 }
@@ -848,6 +909,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	TupleDesc td;
 	ListCell *lc;
 	List *quals;
+	Timestamp timestamp;
 
 	td = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	festate->relation_columns_count = td->natts;
@@ -878,7 +940,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	{
 		elog(MULTICDR_FDW_TRACE_LEVEL, "use column %d for a filename", festate->file_field_column);
 	}
-	if (festate->datemin_field_column >= 0 || festate->datemax_field_column)
+	if (festate->datemin_field_column >= 0 || festate->datemax_field_column >= 0)
 	{
 		elog(MULTICDR_FDW_TRACE_LEVEL, "using date constraints: min from #%d %s and max from #%d %s",
 			festate->datemin_field_column, festate->datemin_field ? festate->datemin_field : "none",
@@ -896,16 +958,18 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	}
 
 	/* extract date restrictions constants */
+	festate->datemin_timestamp = festate->datemax_timestamp = DT_NOEND;
 	if (node->ss.ps.plan->qual)
 	{
 		quals = list_copy(node->ss.ps.qual);
 		foreach (lc, quals)
 		{
 			ExprState *state = lfirst(lc);
-			handle_condition(state, &node->ss, festate->datemin_field, festate->op_oids);
-			handle_condition(state, &node->ss, festate->datemax_field, festate->op_oids);
+			if (handle_condition(state, &node->ss, festate->datemin_field, festate->op_oids, &timestamp))
+				festate->datemin_timestamp = timestamp;
+			if (handle_condition(state, &node->ss, festate->datemax_field, festate->op_oids, &timestamp))
+				festate->datemax_timestamp = timestamp;
 		}
-			
 	}
 
 	/* state set up */
@@ -1409,6 +1473,16 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 		{
 			slot->tts_isnull[column] = false;
 			slot->tts_values[column] = PointerGetDatum(cstring_to_text(lfirst(festate->current_file)));
+		} 
+		else if (column == festate->datemin_field_column)
+		{
+			slot->tts_isnull[column] = false;
+			slot->tts_values[column] = TimestampGetDatum(festate->datemin_timestamp);
+		} 
+		else if (column == festate->datemax_field_column)
+		{
+			slot->tts_isnull[column] = false;
+			slot->tts_values[column] = TimestampGetDatum(festate->datemax_timestamp);
 		}
 		else
 		{

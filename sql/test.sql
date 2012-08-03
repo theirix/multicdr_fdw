@@ -26,7 +26,7 @@ CREATE FOREIGN TABLE multicdr_test_table (
 OPTIONS (
 	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/regression3', 
 	pattern 'MSC_(.*)-([[:digit:]]+)\.cdr$',
-	dateformat '$1=YYYY-MM-DD HH:MI:SS',
+	dateformat '$1=YYYYMMDDHHMISS',
 	posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329',
 	mapfields '0,1,2,3,4,5,6,7,8,9, 0,0,0',
 	dateminfield 'datemin',
