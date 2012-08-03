@@ -19,14 +19,20 @@ CREATE FOREIGN TABLE multicdr_test_table (
     field9 text,
     field10 integer,
 
+		filename text,
 		datemin TIMESTAMP,
 		datemax TIMESTAMP
 ) SERVER multicdr_fdw_server
 OPTIONS (
-	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/regression1', 
-	pattern '.*\.cdr$',
+	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/regression3', 
+	pattern 'MSC_(.*)-([[:digit:]]+)\.cdr$',
+	dateformat '$1=YYYY-MM-DD HH:MI:SS',
 	posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329',
-	mapfields '0,1,2,3,4,5,6,7,8,9',
+	mapfields '0,1,2,3,4,5,6,7,8,9, 0,0,0',
 	dateminfield 'datemin',
-	datemaxfield 'datemax'
+	datemaxfield 'datemax',
+	filefield 'filename'
 );
+
+-- select filename from multicdr_test_table where	datemin = cast('2009-12-01 01:23:45' as timestamp) and
+--		datemax = cast('2012-12-01 01:23:45' as timestamp);

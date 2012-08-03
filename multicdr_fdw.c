@@ -17,22 +17,29 @@
 #include <unistd.h>
 #include <dirent.h>
 
+
 #include "access/reloptions.h"
-#include "catalog/pg_foreign_table.h"
-#include "catalog/pg_type.h"
+#include "access/tupdesc.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_foreign_table.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#include "executor/spi.h"
+#include "fmgr.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
-#include "miscadmin.h"
-#include "optimizer/cost.h"
 #include "mb/pg_wchar.h"
-#include "regex/regex.h"
-#include "utils/builtins.h"
-#include "utils/array.h"
+#include "miscadmin.h"
 #include "nodes/memnodes.h"
-
+#include "optimizer/cost.h"
+#include "regex/regex.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/timestamp.h"
 
 PG_MODULE_MAGIC;
 
@@ -56,6 +63,7 @@ static struct MultiCdrFdwOption valid_options[] = {
 	/* File options */
 	{"directory", ForeignTableRelationId},
 	{"pattern", ForeignTableRelationId},
+	{"dateformat", ForeignTableRelationId},
 	{"posfields", ForeignTableRelationId},
 	{"mapfields", ForeignTableRelationId},
 	{"filefield", ForeignTableRelationId},
@@ -72,17 +80,22 @@ static struct MultiCdrFdwOption valid_options[] = {
 typedef struct MultiCdrExecutionState
 {
 	/* parameters */
-	char		*directory;					/* directory to read */
-	regex_t	pattern_regex;			/* file path regex */
-	char		*file_field;				/* name of field to write a filename */
-	char		*datemin_field;			/* name of field to write a min date */
-	char		*datemax_field;			/* name of field to write a max date */
-	int			file_field_column;	/* column number for a file_field */
-	int			*pos_fields;				/* array for posfields option */
-	int			pos_fields_count;		/* array size for posfields option */
-	int			*map_fields;				/* array for mapfields option */
-	int			map_fields_count;		/* array size for mapfields option */
-	Oid			*column_types;			/* types of columns */
+	char		*directory;						/* directory to read */
+	regex_t	pattern_regex;				/* file path regex */
+	int			regex_date_group_num;	/* group number with a pattern containg a date */
+	char		*date_format;					/* date format */
+	char		*file_field;					/* name of field to write a filename */
+	char		*datemin_field;				/* name of field to write a min date */
+	char		*datemax_field;				/* name of field to write a max date */
+	int			file_field_column;		/* column number for a file_field */
+	int			datemin_field_column;	/* column number for a datemin */
+	int			datemax_field_column;	/* column number for a datemax */
+	int			*pos_fields;					/* array for posfields option */
+	int			pos_fields_count;			/* array size for posfields option */
+	int			*map_fields;					/* array for mapfields option */
+	int			map_fields_count;			/* array size for mapfields option */
+	Oid			*column_types;				/* types of columns */
+	List		*op_oids;							/* allowed operator oids */
 	
 	/* context */
 	char	*read_buf;							/* null-terminated buffer for a whole CDR line */
@@ -113,7 +126,7 @@ typedef struct MultiCdrExecutionState
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
 /* log level, usually DEBUG5 (silent) or NOTICE (messages are sent to client side) */
-#define MULTICDR_FDW_TRACE_LEVEL DEBUG5
+#define MULTICDR_FDW_TRACE_LEVEL NOTICE
 
 /*
  * SQL functions
@@ -141,7 +154,11 @@ static void fileEndForeignScan(ForeignScanState *node);
  */
 static void defGetStringOrNull(DefElem* def, char** field);
 static void defGetStringOrNullPrecheck(DefElem* def, char** field);
+static Timestamp parseTimestamp(const char *str);
 static bool is_valid_option(const char *option, Oid context);
+static pg_wchar* make_wchar_dup(const char *tstr);
+static char* regex_group_str(const char *str, const regmatch_t group);
+static int find_column_by_name (const char *name, TupleDesc tuple_desc);
 static void fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state);
 static void estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 				MultiCdrExecutionState *state,
@@ -201,6 +218,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 	Oid catalog = PG_GETARG_OID(1);
 	char *directory = NULL, 
 			*pattern = NULL, 
+			*date_format = NULL,
 			*file_field = NULL, 
 			*datemin_field = NULL,
 			*datemax_field = NULL,
@@ -267,6 +285,14 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 		{
 			defGetStringOrNullPrecheck(def, &pattern);
 		}
+		else if (strcmp(def->defname, "dateformat") == 0)
+		{
+			defGetStringOrNullPrecheck(def, &date_format);
+			if (!date_format)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("cannot use empty dateformat")));
+		}
 		else if (strcmp(def->defname, "filefield") == 0)
 		{
 			defGetStringOrNullPrecheck(def, &file_field);
@@ -319,6 +345,24 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+static pg_wchar*
+make_wchar_dup(const char *tstr)
+{
+	pg_wchar *result;
+	result = (pg_wchar*) palloc((strlen(tstr) + 1) * sizeof(pg_wchar));
+	pg_mb2wchar(tstr, result);
+	return result;
+}
+
+static char*
+regex_group_str(const char *str, const regmatch_t group)
+{
+	char *result;
+	result = palloc0(group.rm_eo - group.rm_so + 1);
+	memcpy(result, str + group.rm_so, group.rm_eo - group.rm_so);
+	return result;
+}
+
 /*
  * Check if the provided option is one of the valid options.
  * context is the Oid of the catalog holding the object the option is for.
@@ -337,7 +381,7 @@ is_valid_option(const char *option, Oid context)
 }
 
 static void
-defGetStringOrNull(DefElem* def, char** field)
+defGetStringOrNull(DefElem* def, char **field)
 {
 	*field = defGetString(def);
 	if (!strlen(*field))
@@ -345,7 +389,7 @@ defGetStringOrNull(DefElem* def, char** field)
 }
 
 static void
-defGetStringOrNullPrecheck(DefElem* def, char** field)
+defGetStringOrNullPrecheck(DefElem* def, char **field)
 {
 	if (*field)
 		ereport(ERROR,
@@ -356,9 +400,47 @@ defGetStringOrNullPrecheck(DefElem* def, char** field)
 		*field = NULL;
 }
 
+static Timestamp
+parseTimestamp(const char *str)
+{
+  Datum timestamptz;
+	Datum ts;
+  /* format: yyyy-MM-dd HH:mm:ss */
+  timestamptz = OidFunctionCall2(F_TO_TIMESTAMP,
+      PointerGetDatum(cstring_to_text(str)),
+      PointerGetDatum(cstring_to_text("YYYY-MM-DD HH:MI:SS")));
+  Assert(timestamptz);
+  ts = DirectFunctionCall1(timestamptz_timestamp,
+      timestamptz);
+  return DatumGetTimestamp(ts);
+}
+
+static const char*
+timestamp_to_str(Timestamp timestamp)
+{
+  TimestampTz timestamptz = DatumGetTimestampTz(DirectFunctionCall1(timestamp_timestamptz, timestamp));
+  return timestamptz_to_str(timestamptz);
+}
+
+
+static int
+find_column_by_name (const char *name, TupleDesc tuple_desc)
+{
+	int i;
+	if (name && strlen(name))
+	{
+		for (i = 0; i < tuple_desc->natts; ++i)
+		{
+			if (!strcmp(tuple_desc->attrs[i]->attname.data, name))
+				return i;
+		}
+	}
+	return -1;
+}
+
 
 static void
-ereportRegexError(regex_t* regex, int err)
+ereportRegexError(regex_t* regex, const char *prefix, int err)
 {
 	char *buf = NULL;
 	size_t buf_len = 0;
@@ -367,7 +449,7 @@ ereportRegexError(regex_t* regex, int err)
 	buf_len = pg_regerror(err, regex, buf, buf_len);
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
-				errmsg("invalid regular expression: %s", buf)));
+				errmsg("%s: invalid regular expression: %s", prefix, buf)));
 }
 
 /*
@@ -385,10 +467,14 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	List *options;
 	ListCell *lc;
 
-	char *tpattern;
-	const char *tpattern_actual;
-	pg_wchar *wpattern;
 	int err;
+
+	pg_wchar *wpattern;
+	char *tpattern;
+	char *date_format_str;
+	pg_wchar* wdate_format_str;
+	regex_t date_format_regex;
+	regmatch_t groups[3];
 
 	/*
 		* Extract options from FDW objects. We ignore user mappings because
@@ -418,19 +504,48 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		else if (strcmp(def->defname, "pattern") == 0)
 		{
 			defGetStringOrNull(def, &tpattern);
-			if (tpattern)
-				tpattern_actual = tpattern;
-			else
-				tpattern_actual = ".*";
-				
-			wpattern = (pg_wchar*) palloc((strlen(tpattern) + 1) * sizeof(pg_wchar));
-			pg_mb2wchar(tpattern, wpattern);
+			wpattern = make_wchar_dup(tpattern ? tpattern : ".*");
 
 			err = pg_regcomp(&state->pattern_regex, wpattern, pg_wchar_strlen(wpattern), 
-					REG_NOSUB|REG_EXTENDED,DEFAULT_COLLATION_OID);
+					REG_EXTENDED,DEFAULT_COLLATION_OID);
 			if (err)
-				ereportRegexError(&state->pattern_regex, err);
+				ereportRegexError(&state->pattern_regex, "pattern", err);
 			pfree(wpattern);
+		}
+		else if (strcmp(def->defname, "dateformat") == 0)
+		{
+			// this complex block of code just splits 'dateformat' option to a group index and date format string
+			//
+			state->regex_date_group_num = -1;
+
+			defGetStringOrNull(def, &date_format_str);
+
+			elog(MULTICDR_FDW_TRACE_LEVEL, "parsing date format string \"%s\"", date_format_str);
+
+			if (date_format_str == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("empty dateformat detected")));
+
+			wpattern = make_wchar_dup("\\$([[:digit:]]+)=(.*)");
+
+			err = pg_regcomp(&date_format_regex, wpattern, pg_wchar_strlen(wpattern), 
+					REG_EXTENDED,DEFAULT_COLLATION_OID);
+			if (err)
+				ereportRegexError(&date_format_regex, "dateformat", err);
+
+			wdate_format_str = make_wchar_dup(date_format_str);
+			err = pg_regexec(&date_format_regex, wdate_format_str, pg_wchar_strlen(wdate_format_str), 0, NULL, sizeof(groups)/sizeof(groups[0]), groups, 0);
+			if (err)
+				ereportRegexError(&state->pattern_regex, "dateformat parse", err);
+
+			state->regex_date_group_num = safe_strtol(regex_group_str(date_format_str, groups[1]) );
+			state->date_format = regex_group_str(date_format_str, groups[2]);
+
+			pfree(wpattern);
+			pg_regfree(&date_format_regex);
+			
+			elog(MULTICDR_FDW_TRACE_LEVEL, "using date format with group %d and format \"%s\"", state->regex_date_group_num, state->date_format);
 		}
 		else if (strcmp(def->defname, "filefield") == 0)
 		{
@@ -453,6 +568,13 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 			state->map_fields_count = parseIntArray(defGetString(def), &state->map_fields);
 		}
 	}
+
+	elog(MULTICDR_FDW_TRACE_LEVEL, "pattern has %lu groups", state->pattern_regex.re_nsub);
+	if (state->regex_date_group_num < 0 || state->regex_date_group_num >= state->pattern_regex.re_nsub)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+					errmsg("date format references group %d in a pattern which has only %lu groups", 
+							state->regex_date_group_num, state->pattern_regex.re_nsub)));
 
 }
 
@@ -505,6 +627,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 	const int buf_size = sizeof(path);
 	int err;
 	pg_wchar *wpath;
+	bool should_pass = false;
 
 	festate->files = NIL;
 	festate->current_file = NULL;
@@ -533,21 +656,41 @@ enumerateFiles (MultiCdrExecutionState *festate)
 			closedir( dir );
 			return -1;
 		}
-		if ((file_stat.st_mode & S_IFREG) != 0)
+
+		should_pass = true;
+		/* check is it a file */
+		if (should_pass)
 		{
-			wpath = (pg_wchar*) palloc((strlen(path) + 1) * sizeof(pg_wchar));
-			pg_mb2wchar(path, wpath);
+			if ((file_stat.st_mode & S_IFREG) == 0)
+				should_pass = false;
+		}
+
+		/* check is filename is matched */
+		if (should_pass)
+		{
+			wpath = make_wchar_dup(path);
 
 			err = pg_regexec(&festate->pattern_regex, wpath, pg_wchar_strlen(wpath), 0, NULL, 0, NULL, 0);
 			if (err)
 			{
 				elog(MULTICDR_FDW_TRACE_LEVEL, "skip unmatched file \"%s\"", path);
-			}
-			else
-			{
-				festate->files = lappend(festate->files, strdup(path));
+				should_pass = false;
 			}
 			pfree(wpath);
+		}
+
+		/* check for time restriction */
+		if (should_pass)
+		{
+			if (festate->datemin_field_column != -1)
+			{
+			}
+		}
+
+		if (should_pass)
+		{
+			elog(MULTICDR_FDW_TRACE_LEVEL, "this is a file you are looking for, move along \"%s\"", path);
+			festate->files = lappend(festate->files, strdup(path));
 		}
 	}
 
@@ -556,19 +699,170 @@ enumerateFiles (MultiCdrExecutionState *festate)
 }
 
 static void
+fetch_valid_operators_oid(List** oids)
+{
+	int res;
+	int i;
+	bool isnull;
+	Oid oid;
+	MemoryContext	mctxt = CurrentMemoryContext, spimctxt;
+
+	*oids = NIL;
+
+	res	= SPI_connect();
+	if(SPI_OK_CONNECT != res)
+	{
+		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Cannot spi connect: (%d)", res)));
+	}
+	res	= SPI_execute("select o.oid from pg_operator o, pg_type t where"\
+				"(t.oid = o.oprleft or t.oid = o.oprright) and t.typname='timestamp' and o.oprname!='+' and o.oprname!='-'",
+			true, 0);
+	if (res < 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Cannot execute SPI (%d)", res)));
+	}
+
+	for (i = 0; i < SPI_processed; ++i)
+	{
+		oid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		spimctxt = MemoryContextSwitchTo(mctxt);
+		*oids = lappend_oid(*oids, oid);
+		MemoryContextSwitchTo(spimctxt);
+	}
+	res	= SPI_finish();
+ 	if(SPI_OK_FINISH != res)
+	{
+		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Cannot spi finish: (%d)", res)));
+	}
+}
+
+/* Return true if an oid is found in a list */
+static bool
+oid_in_list (List* list, Oid oid)
+{
+	ListCell *lc;
+	foreach (lc, list)
+	{
+		if (oid == lfirst_oid(lc))
+			return true;
+	}
+	return false;
+}
+
+/* returns true if an expression is deleted */
+static bool
+extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, List *allowed_oids, char **desc)
+{
+	OpExpr	   *op = (OpExpr *) node;
+	Node	   *left, *right, *tmp;
+	Index		varattno;
+	char	   *key, *val;
+	StringInfoData	buf;
+
+	if (node == NULL)
+		return false;
+	if (!desc)
+		ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND), errmsg("invalid pointer")));
+	*desc = NULL;
+
+	if (IsA(node, OpExpr))
+	{
+		if (list_length(op->args) != 2)
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Operators with not 2 arguments aren't supported")));
+
+		if (!oid_in_list(allowed_oids, op->opno))
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Operator is not allowed")));
+
+		left = list_nth(op->args, 0);
+		right = list_nth(op->args, 1);
+		if(!(
+			(IsA(left, Var) && IsA(right, Const))
+			||
+			(IsA(left, Const) && IsA(right, Var))
+		))
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("One operand supposed to be column another constant")));
+		if(IsA(left, Const) && IsA(right, Var))
+		{
+			tmp		= left;
+			left	= right;
+			right	= tmp;
+		}
+
+		varattno = ((Var *) left)->varattno;
+		if (!(0 < varattno && varattno <= tupdesc->natts))
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Asserted")));
+		key = NameStr(tupdesc->attrs[varattno - 1]->attname);
+		if (!strcmp(key, field_name))
+		{
+			initStringInfo(&buf);
+			val = (char*)timestamp_to_str(DatumGetTimestamp(((Const*)right)->constvalue));
+			appendStringInfo(&buf, "%s=%s", (unsigned char *) key, (unsigned char *) val);
+			*desc = buf.data;
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+	else
+	{
+		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Only simple WHERE statements are covered")));
+	}
+
+	ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Strange error in parameter parser")));
+
+	return false;
+}
+
+/* returns true if an expression is deleted */
+static bool
+handle_condition (ExprState *state, ScanState *ss, const char* field_name, List *allowed_oids)
+{
+	bool should_remove;
+	char *desc = NULL;
+	Node *node;
+
+	node = (Node*)state->expr;
+	
+	should_remove = extract_date_expression(node, ss->ss_currentRelation->rd_att, 
+			field_name, allowed_oids, &desc);
+	if (should_remove)
+	{
+		/* remove restriction clause from qual (implicitly-ANDed qual conditions) */
+		ss->ps.qual = list_delete(ss->ps.qual, (void*) state);
+
+		elog(MULTICDR_FDW_TRACE_LEVEL, "found condition for field %s: %s", 
+				field_name, desc ? desc : "<null>");
+
+		return true;
+	}
+	return false;
+}
+
+static void
 beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 {
 	ListCell *cell;
 	int i;
+	TupleDesc td;
+	ListCell *lc;
+	List *quals;
 
-	festate->relation_columns_count = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
+	td = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	festate->relation_columns_count = td->natts;
 
 	/* save columns types */
 	festate->column_types = palloc(festate->relation_columns_count * sizeof(Oid));
 	for (i = 0; i < festate->relation_columns_count; ++i)
 	{
-		festate->column_types[i] = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->attrs[i]->atttypid;
-		if (!(festate->column_types[i] == TEXTOID || festate->column_types[i] == INT4OID))
+		festate->column_types[i] = td->attrs[i]->atttypid;
+		if (!(festate->column_types[i] == TEXTOID || 
+					festate->column_types[i] == INT4OID || 
+					(festate->column_types[i] == TIMESTAMPOID && (
+								(festate->datemin_field && !strcmp(td->attrs[i]->attname.data, festate->datemin_field)) ||
+								(festate->datemax_field && !strcmp(td->attrs[i]->attname.data, festate->datemax_field)))
+				)))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
@@ -576,22 +870,22 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 		}
 	}
 
-	/* find a column with filename, may be -1 if none specified */
-	festate->file_field_column = -1;
-	if (festate->file_field && strlen(festate->file_field))
-	{
-		for (i = 0; i < festate->relation_columns_count; ++i)
-		{
-			if (!strcmp(node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->attrs[i]->attname.data, festate->file_field))
-				festate->file_field_column = i;
-		}
-	}
+	/* find a column with filename and dates, -1 if not specified */
+	festate->file_field_column = find_column_by_name(festate->file_field, td);
+	festate->datemin_field_column = find_column_by_name(festate->datemin_field, td);
+	festate->datemax_field_column = find_column_by_name(festate->datemax_field, td);
 	if (festate->file_field_column != -1)
 	{
 		elog(MULTICDR_FDW_TRACE_LEVEL, "use column %d for a filename", festate->file_field_column);
 	}
+	if (festate->datemin_field_column >= 0 || festate->datemax_field_column)
+	{
+		elog(MULTICDR_FDW_TRACE_LEVEL, "using date constraints: min from #%d %s and max from #%d %s",
+			festate->datemin_field_column, festate->datemin_field ? festate->datemin_field : "none",
+			festate->datemax_field_column, festate->datemax_field ? festate->datemax_field : "none");
+	}
 
-	/* if none provided, create default mapping - one-to-one for existing fields */
+	/* if mapping does not exists, create default mapping - one-to-one for existing fields */
 	if (festate->map_fields_count == 0)
 	{
 		elog(MULTICDR_FDW_TRACE_LEVEL, "using default one-to-one mapping for %d columns", festate->relation_columns_count);
@@ -601,13 +895,27 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 			festate->map_fields[i] = i;
 	}
 
+	/* extract date restrictions constants */
+	if (node->ss.ps.plan->qual)
+	{
+		quals = list_copy(node->ss.ps.qual);
+		foreach (lc, quals)
+		{
+			ExprState *state = lfirst(lc);
+			handle_condition(state, &node->ss, festate->datemin_field, festate->op_oids);
+			handle_condition(state, &node->ss, festate->datemax_field, festate->op_oids);
+		}
+			
+	}
+
+	/* state set up */
+
 	/* set up memory buffers */
 	festate->read_buf_size = MULTICDR_FDW_INITIAL_BUF_SIZE;
 	festate->read_buf = palloc(festate->read_buf_size);
 	festate->file_buf = palloc(MULTICDR_FDW_FILEBUF_SIZE);
 	festate->file_buf_start = festate->file_buf_end = festate->file_buf;
 
-	/* column count is specified at config */
 	festate->cdr_columns_count = festate->pos_fields_count;
 	festate->fields_start = palloc(festate->cdr_columns_count * sizeof(char*));
 	festate->fields_end = palloc(festate->cdr_columns_count * sizeof(char*));
@@ -616,7 +924,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	for (i = 0; i < festate->map_fields_count; ++i)
 	{
 		if ((festate->map_fields[i] < 0 || festate->map_fields[i] >= festate->cdr_columns_count) &&
-					i != festate->file_field_column)
+					!(i == festate->file_field_column || i == festate->datemin_field_column || i == festate->datemin_field_column))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
@@ -643,6 +951,7 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 		elog(MULTICDR_FDW_TRACE_LEVEL, "found file: \"%s\"", (char*)lfirst(cell));
 	}
 
+	/* set up first file */
 	moveToNextFile(festate);
 }
 
@@ -751,6 +1060,15 @@ fileBeginForeignScan(ForeignScanState *node, int eflags)
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), festate);
 
 	node->fdw_state = (void *) festate;
+
+	/* find applicable operators */
+	fetch_valid_operators_oid(&festate->op_oids);
+	elog(MULTICDR_FDW_TRACE_LEVEL, "found %d applicable operators", list_length(festate->op_oids));
+	/*foreach(op_oids_cell, op_oids)
+	{
+		elog(MULTICDR_FDW_TRACE_LEVEL, "found op oid %d", (int)lfirst_oid(op_oids_cell) );
+	}*/
+
 
 	beginScan( festate, node );
 }
