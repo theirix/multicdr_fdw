@@ -51,16 +51,16 @@ CREATE FOREIGN TABLE tbl () SERVER file_server;  -- ERROR
 -- test date restrictions
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', dateformat '$1=YYYY');          -- ERROR
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin_none');
+CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin_none');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 DROP FOREIGN TABLE IF EXISTS tbl;
 CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', dateformat '$1=YYYY', dateminfield 'datemin'); -- ERROR
@@ -121,6 +121,38 @@ PREPARE st(int) AS SELECT * FROM tbl_alpha WHERE f2 = $1;
 EXECUTE st(10);
 EXECUTE st(20);
 DEALLOCATE st;
+
+-- date restrictions tests
+CREATE FOREIGN TABLE tbl_date ( 
+	f1 text, 
+	f2 text, 
+	filename text,
+	datemin TIMESTAMP,
+	datemax TIMESTAMP
+) SERVER file_server 
+OPTIONS (directory '@abs_srcdir@/data/regression3', 
+	pattern 'MSC_(.*)-([[:digit:]]+)\.cdr$',
+	dateformat '$1=YYYYMMDDHHMISS',
+	posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329',
+	mapfields '0,1, 0,0,0',
+	dateminfield 'datemin',
+	datemaxfield 'datemax',
+	filefield 'filename'
+);
+\t on
+SELECT filename, COUNT(filename) FROM tbl_date GROUP BY filename ORDER BY filename;
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemin = CAST('2001-12-01 01:23:45' AS TIMESTAMP) AND
+	datemax = CAST('2015-12-01 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemin = CAST('2012-12-01 01:23:45' AS TIMESTAMP) AND
+	datemax = CAST('2012-12-31 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemax = CAST('2012-12-31 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemin = CAST('2013-01-01 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+\t off
+DROP FOREIGN TABLE IF EXISTS tbl_date;
 
 -- tableoid
 SELECT tableoid::regclass, f2 FROM tbl_alpha;

@@ -49,19 +49,19 @@ ERROR:  directory is required for foreign table
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', dateformat '$1=YYYY');          -- ERROR
 ERROR:  date format references a missing pattern
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 ERROR:  referenced column datemin does not exist
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 ERROR:  cannot open directory "foo": No such file or directory
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 ERROR:  invalid column type for date constraint, should be timestamp
 DROP FOREIGN TABLE IF EXISTS tbl;
-CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin_none');
+CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin_none');
 SELECT * FROM tbl LIMIT 1; -- ERROR
 ERROR:  referenced column datemin_none does not exist
 DROP FOREIGN TABLE IF EXISTS tbl;
@@ -501,6 +501,56 @@ EXECUTE st(20);
 (9 rows)
 
 DEALLOCATE st;
+-- date restrictions tests
+CREATE FOREIGN TABLE tbl_date ( 
+	f1 text, 
+	f2 text, 
+	filename text,
+	datemin TIMESTAMP,
+	datemax TIMESTAMP
+) SERVER file_server 
+OPTIONS (directory '/projects/concerteza/sqlmed/multicdr_fdw/data/regression3', 
+	pattern 'MSC_(.*)-([[:digit:]]+)\.cdr$',
+	dateformat '$1=YYYYMMDDHHMISS',
+	posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329',
+	mapfields '0,1, 0,0,0',
+	dateminfield 'datemin',
+	datemaxfield 'datemax',
+	filefield 'filename'
+);
+\t on
+SELECT filename, COUNT(filename) FROM tbl_date GROUP BY filename ORDER BY filename;
+ @abs_srcdir@/data/regression3/MSC_20121201074000-1.cdr |     6
+ @abs_srcdir@/data/regression3/MSC_20121209074000-2.cdr |    12
+ @abs_srcdir@/data/regression3/MSC_20130102074000-3.cdr |    13
+ @abs_srcdir@/data/regression3/MSC_20130102084000-4.cdr |    69
+
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemin = CAST('2001-12-01 01:23:45' AS TIMESTAMP) AND
+	datemax = CAST('2015-12-01 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+ @abs_srcdir@/data/regression3/MSC_20121201074000-1.cdr |     6
+ @abs_srcdir@/data/regression3/MSC_20121209074000-2.cdr |    12
+ @abs_srcdir@/data/regression3/MSC_20130102074000-3.cdr |    13
+ @abs_srcdir@/data/regression3/MSC_20130102084000-4.cdr |    69
+
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemin = CAST('2012-12-01 01:23:45' AS TIMESTAMP) AND
+	datemax = CAST('2012-12-31 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+ @abs_srcdir@/data/regression3/MSC_20121201074000-1.cdr |     6
+ @abs_srcdir@/data/regression3/MSC_20121209074000-2.cdr |    12
+
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemax = CAST('2012-12-31 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+ @abs_srcdir@/data/regression3/MSC_20121201074000-1.cdr |     6
+ @abs_srcdir@/data/regression3/MSC_20121209074000-2.cdr |    12
+
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	datemin = CAST('2013-01-01 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+ @abs_srcdir@/data/regression3/MSC_20130102074000-3.cdr |    13
+ @abs_srcdir@/data/regression3/MSC_20130102084000-4.cdr |    69
+
+\t off
+DROP FOREIGN TABLE IF EXISTS tbl_date;
 -- tableoid
 SELECT tableoid::regclass, f2 FROM tbl_alpha;
  tableoid  | f2 

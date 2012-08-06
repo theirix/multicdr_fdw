@@ -509,6 +509,11 @@ parseOptions(Oid catalog, List *options, MultiCdrExecutionState *state)
 					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
 						errmsg("directory is required for foreign table")));
 		}
+		
+		if ((state->date_format != NULL) != (state->datemin_field || state->datemax_field))
+		{
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("dateformat and dateminfield/datemaxfield must be specified simultaneously")));
+		}
 	}
 }
 
@@ -645,11 +650,6 @@ enumerateFiles (MultiCdrExecutionState *festate)
 			}
 			pfree(wpath);
 		}
-			
-		if ((festate->date_format != NULL) != (festate->datemin_timestamp != DT_NOEND || festate->datemax_timestamp != DT_NOEND))
-		{
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("dateformat and dateminfield/datemaxfield must be both specified")));
-		}
 
 		/* prepare check for time restriction */
 		if (should_pass && festate->date_format)
@@ -684,7 +684,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 		}
 
 		/* check datemin */
-		if (should_pass && festate->date_format && festate->datemin_timestamp)
+		if (should_pass && festate->date_format && festate->datemin_timestamp != DT_NOEND)
 		{
 			if (!DatumGetBool(DirectFunctionCall2(timestamp_ge, 
 							TimestampGetDatum(file_timestamp),
@@ -697,7 +697,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 		}
 
 		/* check datemax */
-		if (should_pass && festate->date_format && festate->datemax_timestamp)
+		if (should_pass && festate->date_format && festate->datemax_timestamp != DT_NOEND)
 		{
 			if (!DatumGetBool(DirectFunctionCall2(timestamp_le, 
 							TimestampGetDatum(file_timestamp),
