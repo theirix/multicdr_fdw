@@ -32,6 +32,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/memnodes.h"
+#include "nodes/print.h"
 #include "optimizer/cost.h"
 #include "regex/regex.h"
 #include "utils/array.h"
@@ -130,7 +131,7 @@ typedef struct MultiCdrExecutionState
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
 /* log level, usually DEBUG5 (silent) or NOTICE (messages are sent to client side) */
-#define MULTICDR_FDW_TRACE_LEVEL DEBUG5
+#define MULTICDR_FDW_TRACE_LEVEL NOTICE
 
 /*
  * SQL functions
@@ -266,7 +267,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
       ereport(ERROR,
           (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
             errmsg("invalid option \"%s\"", def->defname),
-            errhint("Valid options in this context are: %s", buf.data)));
+            errhint("valid options in this context are: %s", buf.data)));
     }
 	}
 	
@@ -583,7 +584,7 @@ fileExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	/* Fetch options */
 	fileGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &state);
 
-	/*ExplainPropertyText("Foreign Directory", state.directory, es);*/
+	/*ExplainPropertyText("foreign Directory", state.directory, es);*/
 }
 
 static int
@@ -734,14 +735,14 @@ fetch_valid_operators_oid(List** oids)
 	res	= SPI_connect();
 	if(SPI_OK_CONNECT != res)
 	{
-		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Cannot spi connect: (%d)", res)));
+		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("cannot spi connect: (%d)", res)));
 	}
 	res	= SPI_execute("select o.oid from pg_operator o, pg_type t where "\
 				"(t.oid = o.oprleft or t.oid = o.oprright) and t.typname='timestamp' and o.oprname='=' and o.oprname!='+' and o.oprname!='-'",
 			true, 0);
 	if (res < 0)
 	{
-		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Cannot execute SPI (%d)", res)));
+		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("cannot execute SPI (%d)", res)));
 	}
 
 	for (i = 0; i < SPI_processed; ++i)
@@ -754,21 +755,8 @@ fetch_valid_operators_oid(List** oids)
 	res	= SPI_finish();
  	if(SPI_OK_FINISH != res)
 	{
-		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Cannot spi finish: (%d)", res)));
+		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("cannot spi finish: (%d)", res)));
 	}
-}
-
-/* Return true if an oid is found in a list */
-static bool
-oid_in_list (List* list, Oid oid)
-{
-	ListCell *lc;
-	foreach (lc, list)
-	{
-		if (oid == lfirst_oid(lc))
-			return true;
-	}
-	return false;
 }
 
 /* returns true if an expression is deleted */
@@ -779,6 +767,7 @@ extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, L
 	Node *left, *right, *tmp;
 	Index varattno;
 	char *key;
+	char *s;
 
 	if (!timestamp)
 		ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND), errmsg("invalid pointer")));
@@ -789,15 +778,21 @@ extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, L
 
 	if (IsA(node, OpExpr))
 	{
+		s = pretty_format_node_dump(nodeToString(node));
+		elog(MULTICDR_FDW_TRACE_LEVEL, "node: %s", s );
+
 		if (list_length(op->args) != 2)
+		{
+			elog(MULTICDR_FDW_TRACE_LEVEL, "strange dim %d", list_length(op->args));
 			return false;
+		}
 
 		left = list_nth(op->args, 0);
 		right = list_nth(op->args, 1);
 		if(!(   (IsA(left, Var) && IsA(right, Const))
 				||  (IsA(left, Const) && IsA(right, Var))
 				))
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("One operand supposed to be column another constant")));
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("one operand supposed to be column another constant")));
 		if(IsA(left, Const) && IsA(right, Var))
 		{
 			tmp = left;
@@ -808,19 +803,19 @@ extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, L
 
 		varattno = ((Var *) left)->varattno;
 		if (varattno <= 0 || varattno > tupdesc->natts)
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Wrong varattno index")));
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("wrong varattno index")));
 		key = NameStr(tupdesc->attrs[varattno - 1]->attname);
 		if (strcmp(key, field_name))
 		{
-			elog(MULTICDR_FDW_TRACE_LEVEL, "Skipping expression for a node %s, needed %s", key, field_name);
+			elog(MULTICDR_FDW_TRACE_LEVEL, "skipping expression for a node %s, needed %s", key, field_name);
 			return false;
 		}
 		else
 		{
-			if (!oid_in_list(allowed_oids, op->opno))
-				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Operator opno=%d is not allowed", op->opno)));
+			if (!list_member_oid(allowed_oids, op->opno))
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("operator opno=%d is not allowed", op->opno)));
 
-			elog(MULTICDR_FDW_TRACE_LEVEL, "Found node %s operation %d", key, op->opno);
+			elog(MULTICDR_FDW_TRACE_LEVEL, "found node %s operation %d", key, op->opno);
 			*timestamp = DatumGetTimestamp(((Const*)right)->constvalue);
 			return true;
 		}
@@ -842,9 +837,6 @@ handle_condition (ExprState *state, ScanState *ss, const char* field_name, List 
 			field_name, allowed_oids, timestamp);
 	if (should_remove)
 	{
-		/* remove restriction clause from qual (implicitly-ANDed qual conditions) */
-		ss->ps.qual = list_delete(ss->ps.qual, (void*) state);
-
 		elog(MULTICDR_FDW_TRACE_LEVEL, "found condition for field %s: %s", 
 				field_name, *timestamp != DT_NOEND ? timestamp_to_str(*timestamp) : "<none>");
 
@@ -864,7 +856,8 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	int i;
 	TupleDesc td;
 	ListCell *lc;
-	List *quals;
+	List *removed;
+	ExprState *state;
 	Timestamp timestamp;
 
 	td = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
@@ -935,16 +928,31 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	festate->datemin_timestamp = festate->datemax_timestamp = DT_NOEND;
 	if (node->ss.ps.plan->qual)
 	{
-		quals = list_copy(node->ss.ps.qual);
-		foreach (lc, quals)
+		removed = NIL;
+		foreach (lc, node->ss.ps.qual)
 		{
-			ExprState *state = lfirst(lc);
-			if (festate->datemin_field && handle_condition(state, &node->ss, festate->datemin_field, festate->op_oids, &timestamp))
+			state = (ExprState*)lfirst(lc);
+			if (festate->datemin_field && handle_condition(state, &node->ss, festate->datemin_field, 
+						festate->op_oids, &timestamp))
+			{
+				removed = list_append_unique_ptr(removed, state);
 				festate->datemin_timestamp = timestamp;
-			if (festate->datemax_field && handle_condition(state, &node->ss, festate->datemax_field, festate->op_oids, &timestamp))
+			}
+			if (festate->datemax_field && handle_condition(state, &node->ss, festate->datemax_field, 
+						festate->op_oids, &timestamp))
+			{
+				removed = list_append_unique_ptr(removed, state);
 				festate->datemax_timestamp = timestamp;
+			}
 		}
+		/* remove restriction clause from qual (implicitly-ANDed qual conditions) */
+		/* don't remove nodes, it failes for a strange reason 
+		foreach (lc, removed)
+		{
+			node->ss.ps.qual = list_delete(node->ss.ps.qual, lfirst(lc));
+		}*/
 	}
+
 
 	/* state set up */
 
@@ -1118,7 +1126,7 @@ fileErrorCallback(void *arg)
 	char* fn;
 
 	fn = festate->current_file ? lfirst(festate->current_file) : "<none>";
-	errcontext("MultiCDR Foreign Table filename: \"%s\" record: %d", fn, festate->recnum);
+	errcontext("multiCDR Foreign Table filename: \"%s\" record: %d", fn, festate->recnum);
 }
 
 /*
@@ -1377,7 +1385,7 @@ parseLine(MultiCdrExecutionState *festate)
 
 	if (festate->read_buf + festate->pos_fields[festate->pos_fields_count-1] >= string_end)
 	{
-		elog(MULTICDR_FDW_TRACE_LEVEL, "Skipping special row %d", festate->cdr_row);
+		elog(MULTICDR_FDW_TRACE_LEVEL, "skipping special row %d", festate->cdr_row);
 		return false;
 	}
 

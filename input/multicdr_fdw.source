@@ -82,7 +82,7 @@ CREATE FOREIGN TABLE tbl_alpha (
   f4 int4,
   f5 text
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '');
+OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329');
 CREATE FOREIGN TABLE tbl_beta (
   f1 text,
   f2 int4,
@@ -90,13 +90,13 @@ CREATE FOREIGN TABLE tbl_beta (
   f4 int4,
   f5 text
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '');
+OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329');
 GRANT SELECT ON tbl_beta TO file_fdw_user;
 CREATE FOREIGN TABLE tbl_bad (
   f1 text,
   f2 text
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression9000', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '');
+OPTIONS (directory '@abs_srcdir@/data/regression9000', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329');
 
 -- basic query tests
 SELECT * FROM tbl_alpha ORDER BY f4;
@@ -151,6 +151,10 @@ SELECT filename, COUNT(filename) FROM tbl_date WHERE
 	datemax = CAST('2012-12-31 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
 SELECT filename, COUNT(filename) FROM tbl_date WHERE
 	datemin = CAST('2013-01-01 01:23:45' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
+SELECT filename, COUNT(filename) FROM tbl_date WHERE
+	filename = '@abs_srcdir@/data/regression3/MSC_20121201074000-1.cdr' AND
+	datemin = CAST('2012-12-01 07:39:00' AS TIMESTAMP) AND
+	datemax = CAST('2012-12-01 07:41:00' AS TIMESTAMP) GROUP BY filename ORDER BY filename;
 \t off
 DROP FOREIGN TABLE IF EXISTS tbl_date;
 
