@@ -5,7 +5,7 @@
 -- Clean up in case a prior regression run failed
 SET client_min_messages TO 'error';
 DROP ROLE IF EXISTS file_fdw_superuser, file_fdw_user, no_priv_user;
-RESET client_min_messages;
+SET client_min_messages TO 'warning';
 
 CREATE ROLE file_fdw_superuser LOGIN SUPERUSER; -- is a superuser
 CREATE ROLE file_fdw_user LOGIN;                -- has priv and user mapping
@@ -48,6 +48,33 @@ DROP FOREIGN TABLE IF EXISTS tbl;
 CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (posfields '1,foo,2');          -- ERROR
 CREATE FOREIGN TABLE tbl () SERVER file_server;  -- ERROR
 
+-- test date restrictions
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', dateformat '$1=YYYY');          -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl () SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+SELECT * FROM tbl LIMIT 1; -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+SELECT * FROM tbl LIMIT 1; -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin');
+SELECT * FROM tbl LIMIT 1; -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin text ) SERVER file_server OPTIONS (directory 'foo', dateminfield 'datemin_none');
+SELECT * FROM tbl LIMIT 1; -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', dateformat '$1=YYYY', dateminfield 'datemin'); -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$2=YYYY', dateminfield 'datemin'); -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1=YYYY', dateminfield 'datemin');
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat 'YYYY', dateminfield 'datemin'); -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+CREATE FOREIGN TABLE tbl ( datemin TIMESTAMP ) SERVER file_server OPTIONS (directory 'foo', pattern '(.*).cdr', dateformat '$1', dateminfield 'datemin'); -- ERROR
+DROP FOREIGN TABLE IF EXISTS tbl;
+
+-- various selects
 CREATE FOREIGN TABLE tbl_alpha (
   f1 text,
   f2 int4,
@@ -176,4 +203,5 @@ RESET ROLE;
 DROP EXTENSION multicdr_fdw CASCADE;
 DROP ROLE file_fdw_superuser, file_fdw_user, no_priv_user;
 
+RESET client_min_messages;
 -- vim: ft=sql

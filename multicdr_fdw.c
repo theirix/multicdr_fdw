@@ -156,13 +156,13 @@ static void fileEndForeignScan(ForeignScanState *node);
 /*
  * Helper functions
  */
-static void defGetStringOrNull(DefElem* def, char** field);
 static void defGetStringOrNullPrecheck(DefElem* def, char** field);
 static Timestamp parseTimestamp(const char *str, const char *fmt);
 static bool is_valid_option(const char *option, Oid context);
 static pg_wchar* make_wchar_dup(const char *tstr);
 static char* regex_group_str(const char *str, const regmatch_t group);
 static int find_column_by_name (const char *name, TupleDesc tuple_desc);
+static void parseOptions(Oid catalog, List *options, MultiCdrExecutionState *state);
 static void fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state);
 static void estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 				MultiCdrExecutionState *state,
@@ -220,16 +220,7 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid catalog = PG_GETARG_OID(1);
-	char *directory = NULL, 
-			*pattern = NULL, 
-			*date_format = NULL,
-			*file_field = NULL, 
-			*datemin_field = NULL,
-			*datemax_field = NULL,
-			*map_fields_str = NULL, 
-			*pos_fields_str = NULL;
-	int *map_fields, *pos_fields;
-	int map_fields_count, pos_fields_count;
+	MultiCdrExecutionState dummy_state;
 	ListCell *cell;
 
 	/*
@@ -250,101 +241,36 @@ multicdr_fdw_validator(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					errmsg("only superuser can change options of a multicdr_fdw foreign table")));
 
-	/*
-		* Check that only options supported by multicdr_fdw, and allowed for the
-		* current object type, are given.
-		*/
-	foreach(cell, options_list)
-	{
-		DefElem *def = (DefElem *) lfirst(cell);
+	/* Check for unknown options */
+  foreach(cell, options_list)
+  {
+    DefElem *def = (DefElem *) lfirst(cell);
 
-		if (!is_valid_option(def->defname, catalog))
-		{
-			struct MultiCdrFdwOption *opt;
-			StringInfoData buf;
+    if (!is_valid_option(def->defname, catalog))
+    {
+      struct MultiCdrFdwOption *opt;
+      StringInfoData buf;
 
-			/*
-				* Unknown option specified, complain about it. Provide a hint
-				* with list of valid options for the object.
-				*/
-			initStringInfo(&buf);
-			for (opt = valid_options; opt->optname; opt++)
-			{
-				if (catalog == opt->optcontext)
-					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-						opt->optname);
-			}
+      /*
+        * Unknown option specified, complain about it. Provide a hint
+        * with list of valid options for the object.
+        */
+      initStringInfo(&buf);
+      for (opt = valid_options; opt->optname; opt++)
+      {
+        if (catalog == opt->optcontext)
+          appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
+            opt->optname);
+      }
 
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-						errmsg("invalid option \"%s\"", def->defname),
-						errhint("Valid options in this context are: %s", buf.data)));
-		}
-
-		if (strcmp(def->defname, "directory") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &directory);
-		}
-		else if (strcmp(def->defname, "pattern") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &pattern);
-		}
-		else if (strcmp(def->defname, "dateformat") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &date_format);
-			if (!date_format)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-							errmsg("cannot use empty dateformat")));
-		}
-		else if (strcmp(def->defname, "filefield") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &file_field);
-		}
-		else if (strcmp(def->defname, "dateminfield") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &datemin_field);
-		}
-		else if (strcmp(def->defname, "datemaxfield") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &datemax_field);
-		}
-		else if (strcmp(def->defname, "mapfields") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &map_fields_str);
-
-			map_fields_count = parseIntArray(map_fields_str, &map_fields);
-			if (map_fields == NULL && map_fields_count > 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-							errmsg("invalid fields mapping")));
-			if (map_fields)
-				pfree(map_fields);
-		}
-		else if (strcmp(def->defname, "posfields") == 0)
-		{
-			defGetStringOrNullPrecheck(def, &pos_fields_str);
-
-			pos_fields_count = parseIntArray(pos_fields_str, &pos_fields);
-			if (pos_fields == NULL && pos_fields_count > 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-							errmsg("invalid position mapping")));
-			if (pos_fields)
-				pfree(pos_fields);
-		}
+      ereport(ERROR,
+          (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+            errmsg("invalid option \"%s\"", def->defname),
+            errhint("Valid options in this context are: %s", buf.data)));
+    }
 	}
 	
-	/*
-		* Options that are required for multicdr_fdw foreign tables.
-		*/
-	if (catalog == ForeignTableRelationId)
-	{
-		if (directory == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-						errmsg("directory is required for foreign table")));
-	}
+	parseOptions(catalog, options_list, &dummy_state);
 
 	PG_RETURN_VOID();
 }
@@ -384,21 +310,16 @@ is_valid_option(const char *option, Oid context)
 	return false;
 }
 
-static void
-defGetStringOrNull(DefElem* def, char **field)
-{
-	*field = defGetString(def);
-	if (!strlen(*field))
-		*field = NULL;
-}
-
+/* This syntax is required for checking for duplicate options
+ * If options is specified twice, first 'if' evaluates
+ */
 static void
 defGetStringOrNullPrecheck(DefElem* def, char **field)
 {
 	if (*field)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("conflicting or redundant options")));
+				 errmsg("conflicting or redundant options %s", def->defname)));
 	*field = defGetString(def);
 	if (!strlen(*field))
 		*field = NULL;
@@ -438,6 +359,9 @@ find_column_by_name (const char *name, TupleDesc tuple_desc)
 				return i;
 		}
 	}
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+				errmsg("referenced column %s does not exist", name)));
 	return -1;
 }
 
@@ -455,58 +379,35 @@ ereportRegexError(regex_t* regex, const char *prefix, int err)
 				errmsg("%s: invalid regular expression: %s", prefix, buf)));
 }
 
-/*
- * Fetch the options for a multicdr_fdw foreign table.
- *
- * We have to separate out "filename" from the other options because
- * it must not appear in the options list passed to the core COPY code.
- */
 static void
-fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
+parseOptions(Oid catalog, List *options, MultiCdrExecutionState *state)
 {
-	ForeignTable *table;
-	ForeignServer *server;
-	ForeignDataWrapper *wrapper;
-	List *options;
 	ListCell *lc;
-
 	int err;
-
 	pg_wchar *wpattern;
-	char *tpattern;
-	char *date_format_str;
+	char *tpattern = NULL;
+	char *date_format_str = NULL;
+	char *map_fields_str = NULL;
+	char *pos_fields_str = NULL;
 	pg_wchar* wdate_format_str;
 	regex_t date_format_regex;
 	regmatch_t groups[3];
 
-	/*
-		* Extract options from FDW objects. We ignore user mappings because
-		* multicdr_fdw doesn't have any options that can be specified there.
-		*/
-	table = GetForeignTable(foreigntableid);
-	server = GetForeignServer(table->serverid);
-	wrapper = GetForeignDataWrapper(server->fdwid);
 
-	options = NIL;
-	options = list_concat(options, wrapper->options);
-	options = list_concat(options, server->options);
-	options = list_concat(options, table->options);
-
-	/*
-		* Read options
-		*/
+	/* Read options */
 	MemSet(state, 0, sizeof(MultiCdrExecutionState));
+
 	foreach(lc, options)
 	{
 		DefElem *def = (DefElem *) lfirst(lc);
 
 		if (strcmp(def->defname, "directory") == 0)
 		{
-			defGetStringOrNull(def, &state->directory);
+			defGetStringOrNullPrecheck(def, &state->directory);
 		}
 		else if (strcmp(def->defname, "pattern") == 0)
 		{
-			defGetStringOrNull(def, &tpattern);
+			defGetStringOrNullPrecheck(def, &tpattern);
 			wpattern = make_wchar_dup(tpattern ? tpattern : ".*");
 
 			err = pg_regcomp(&state->pattern_regex, wpattern, pg_wchar_strlen(wpattern), 
@@ -521,14 +422,14 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 			//
 			state->regex_date_group_num = -1;
 
-			defGetStringOrNull(def, &date_format_str);
-
-			elog(MULTICDR_FDW_TRACE_LEVEL, "parsing date format string \"%s\"", date_format_str);
+			defGetStringOrNullPrecheck(def, &date_format_str);
 
 			if (date_format_str == NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 							errmsg("empty dateformat detected")));
+			
+			elog(MULTICDR_FDW_TRACE_LEVEL, "parsing date format string \"%s\"", date_format_str);
 
 			wpattern = make_wchar_dup("\\$([[:digit:]]+)=(.*)");
 
@@ -552,34 +453,93 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 		}
 		else if (strcmp(def->defname, "filefield") == 0)
 		{
-			defGetStringOrNull(def, &state->file_field);
+			defGetStringOrNullPrecheck(def, &state->file_field);
 		}
 		else if (strcmp(def->defname, "dateminfield") == 0)
 		{
-			defGetStringOrNull(def, &state->datemin_field);
+			defGetStringOrNullPrecheck(def, &state->datemin_field);
 		}
 		else if (strcmp(def->defname, "datemaxfield") == 0)
 		{
-			defGetStringOrNull(def, &state->datemax_field);
+			defGetStringOrNullPrecheck(def, &state->datemax_field);
 		}
 		else if (strcmp(def->defname, "posfields") == 0)
 		{
-			state->pos_fields_count = parseIntArray(defGetString(def), &state->pos_fields);
+			defGetStringOrNullPrecheck(def, &pos_fields_str);
+			state->pos_fields_count = parseIntArray(pos_fields_str, &state->pos_fields);
+			if (state->pos_fields == NULL && state->pos_fields_count > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("invalid position mapping")));
 		}
 		else if (strcmp(def->defname, "mapfields") == 0)
 		{
-			state->map_fields_count = parseIntArray(defGetString(def), &state->map_fields);
+			defGetStringOrNullPrecheck(def, &map_fields_str);
+			state->map_fields_count = parseIntArray(map_fields_str, &state->map_fields);
+			if (state->map_fields == NULL && state->map_fields_count > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("invalid fields mapping")));
 		}
 	}
 
-	elog(MULTICDR_FDW_TRACE_LEVEL, "pattern has %lu groups", state->pattern_regex.re_nsub);
-	if (state->date_format && 
-				(state->regex_date_group_num < 0 || state->regex_date_group_num >= state->pattern_regex.re_nsub))
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-					errmsg("date format references group %d in a pattern which has only %lu groups", 
-							state->regex_date_group_num, state->pattern_regex.re_nsub)));
+	if (catalog == ForeignTableRelationId)
+	{
+		if (state->pattern_regex.re_magic)
+		{
+			elog(MULTICDR_FDW_TRACE_LEVEL, "pattern has %lu groups", state->pattern_regex.re_nsub);
+		}
 
+		if (state->date_format)
+		{
+			if (state->pattern_regex.re_magic == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("date format references a missing pattern")));
+			if (state->regex_date_group_num < 0 || state->regex_date_group_num > state->pattern_regex.re_nsub)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("date format references group %d in a pattern which has only %lu groups", 
+									state->regex_date_group_num, state->pattern_regex.re_nsub)));
+		}
+			
+		if (state->directory == NULL)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+						errmsg("directory is required for foreign table")));
+		}
+	}
+}
+
+/*
+ * Fetch the options for a multicdr_fdw foreign table.
+ *
+ * We have to separate out "filename" from the other options because
+ * it must not appear in the options list passed to the core COPY code.
+ */
+static void
+fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
+{
+	ForeignTable *table;
+	ForeignServer *server;
+	ForeignDataWrapper *wrapper;
+	List *options;
+
+	/*
+		* Extract options from FDW objects. We ignore user mappings because
+		* multicdr_fdw doesn't have any options that can be specified there.
+		*/
+	table = GetForeignTable(foreigntableid);
+	server = GetForeignServer(table->serverid);
+	wrapper = GetForeignDataWrapper(server->fdwid);
+
+	options = NIL;
+	options = list_concat(options, wrapper->options);
+	options = list_concat(options, server->options);
+	options = list_concat(options, table->options);
+
+	parseOptions(ForeignTableRelationId, options, state);
 }
 
 /*
@@ -929,18 +889,36 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 	}
 
 	/* find a column with filename and dates, -1 if not specified */
-	festate->file_field_column = find_column_by_name(festate->file_field, td);
-	festate->datemin_field_column = find_column_by_name(festate->datemin_field, td);
-	festate->datemax_field_column = find_column_by_name(festate->datemax_field, td);
-	if (festate->file_field_column != -1)
+	festate->file_field_column = festate->file_field
+		? find_column_by_name(festate->file_field, td) : -1;
+	festate->datemin_field_column = festate->datemin_field
+		? find_column_by_name(festate->datemin_field, td) : -1;
+	festate->datemax_field_column = festate->datemax_field
+		? find_column_by_name(festate->datemax_field, td) : -1;
+
+
+	/* log columns */
+	if (festate->file_field_column >= 0)
 	{
 		elog(MULTICDR_FDW_TRACE_LEVEL, "use column %d for a filename", festate->file_field_column);
 	}
-	if (festate->datemin_field_column >= 0 || festate->datemax_field_column >= 0)
+	if (festate->datemin_field_column >= 0)
 	{
-		elog(MULTICDR_FDW_TRACE_LEVEL, "using date constraints: min from #%d %s and max from #%d %s",
-			festate->datemin_field_column, festate->datemin_field ? festate->datemin_field : "none",
+		elog(MULTICDR_FDW_TRACE_LEVEL, "using min date constraint: #%d %s",
+			festate->datemin_field_column, festate->datemin_field ? festate->datemin_field : "none");
+		if (festate->column_types[festate->datemin_field_column] != TIMESTAMPOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+						errmsg("invalid column type for date constraint, should be timestamp")));
+	}
+	if (festate->datemax_field_column >= 0)
+	{
+		elog(MULTICDR_FDW_TRACE_LEVEL, "using max date constraint: #%d %s",
 			festate->datemax_field_column, festate->datemax_field ? festate->datemax_field : "none");
+		if (festate->column_types[festate->datemax_field_column] != TIMESTAMPOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+						errmsg("invalid column type for date constraint, should be timestamp")));
 	}
 
 	/* if mapping does not exists, create default mapping - one-to-one for existing fields */
