@@ -20,7 +20,7 @@ CREATE SERVER file_server FOREIGN DATA WRAPPER multicdr_fdw;
 
 -- privilege tests
 SET ROLE file_fdw_user;
-CREATE FOREIGN DATA WRAPPER file_fdw2 HANDLER file_fdw_handler VALIDATOR file_fdw_validator;   -- ERROR
+CREATE FOREIGN DATA WRAPPER multicdr_fdw2 HANDLER file_fdw_handler VALIDATOR file_fdw_validator;   -- ERROR
 CREATE SERVER file_server2 FOREIGN DATA WRAPPER multicdr_fdw;   -- ERROR
 CREATE USER MAPPING FOR file_fdw_user SERVER file_server;   -- ERROR
 

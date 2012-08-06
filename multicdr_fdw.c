@@ -83,10 +83,11 @@ typedef struct MultiCdrExecutionState
 	regex_t		pattern_regex;				/* file path regex */
 	int				regex_date_group_num;	/* group number with a pattern containg a date */
 	char			*date_format;					/* date format */
-
 	char			*file_field;					/* name of field to write a filename */
 	char			*datemin_field;				/* name of field to write a min date */
 	char			*datemax_field;				/* name of field to write a max date */
+
+	/* computed parameters */
 	Timestamp	datemin_timestamp;		/* timestamp with min date */
 	Timestamp	datemax_timestamp;		/* timestamp with max date */
 	int				file_field_column;		/* column number for a file_field */
@@ -129,7 +130,7 @@ typedef struct MultiCdrExecutionState
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
 /* log level, usually DEBUG5 (silent) or NOTICE (messages are sent to client side) */
-#define MULTICDR_FDW_TRACE_LEVEL NOTICE
+#define MULTICDR_FDW_TRACE_LEVEL DEBUG5
 
 /*
  * SQL functions
@@ -572,7 +573,8 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	}
 
 	elog(MULTICDR_FDW_TRACE_LEVEL, "pattern has %lu groups", state->pattern_regex.re_nsub);
-	if (state->regex_date_group_num < 0 || state->regex_date_group_num >= state->pattern_regex.re_nsub)
+	if (state->date_format && 
+				(state->regex_date_group_num < 0 || state->regex_date_group_num >= state->pattern_regex.re_nsub))
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 					errmsg("date format references group %d in a pattern which has only %lu groups", 
@@ -684,7 +686,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 			pfree(wpath);
 		}
 			
-		if ((festate->date_format != NULL) != (festate->datemin_timestamp || festate->datemax_timestamp))
+		if ((festate->date_format != NULL) != (festate->datemin_timestamp != DT_NOEND || festate->datemax_timestamp != DT_NOEND))
 		{
 			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("dateformat and dateminfield/datemaxfield must be both specified")));
 		}
@@ -813,10 +815,10 @@ oid_in_list (List* list, Oid oid)
 static bool
 extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, List *allowed_oids, Timestamp *timestamp)
 {
-	OpExpr	   *op = (OpExpr *) node;
-	Node	   *left, *right, *tmp;
-	Index		varattno;
-	char	   *key;
+	OpExpr *op = (OpExpr *) node;
+	Node *left, *right, *tmp;
+	Index varattno;
+	char *key;
 
 	if (!timestamp)
 		ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND), errmsg("invalid pointer")));
@@ -828,47 +830,41 @@ extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, L
 	if (IsA(node, OpExpr))
 	{
 		if (list_length(op->args) != 2)
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Operators with not 2 arguments aren't supported")));
-
-		if (!oid_in_list(allowed_oids, op->opno))
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Operator is not allowed")));
+			return false;
 
 		left = list_nth(op->args, 0);
 		right = list_nth(op->args, 1);
-		if(!(
-			(IsA(left, Var) && IsA(right, Const))
-			||
-			(IsA(left, Const) && IsA(right, Var))
-		))
+		if(!(   (IsA(left, Var) && IsA(right, Const))
+				||  (IsA(left, Const) && IsA(right, Var))
+				))
 			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("One operand supposed to be column another constant")));
 		if(IsA(left, Const) && IsA(right, Var))
 		{
-			tmp		= left;
-			left	= right;
-			right	= tmp;
+			tmp = left;
+			left = right;
+			right = tmp;
 		}
 
+
 		varattno = ((Var *) left)->varattno;
-		if (!(0 < varattno && varattno <= tupdesc->natts))
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Asserted")));
+		if (varattno <= 0 || varattno > tupdesc->natts)
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Wrong varattno index")));
 		key = NameStr(tupdesc->attrs[varattno - 1]->attname);
-		if (!strcmp(key, field_name))
+		if (strcmp(key, field_name))
 		{
+			elog(MULTICDR_FDW_TRACE_LEVEL, "Skipping expression for a node %s, needed %s", key, field_name);
+			return false;
+		}
+		else
+		{
+			if (!oid_in_list(allowed_oids, op->opno))
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Operator opno=%d is not allowed", op->opno)));
+
 			elog(MULTICDR_FDW_TRACE_LEVEL, "Found node %s operation %d", key, op->opno);
 			*timestamp = DatumGetTimestamp(((Const*)right)->constvalue);
 			return true;
 		}
-		else
-		{
-			return false;
-		}
 	}
-	else
-	{
-		ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Only simple WHERE statements are covered")));
-	}
-
-	ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Strange error in parameter parser")));
 
 	return false;
 }
@@ -965,9 +961,9 @@ beginScan(MultiCdrExecutionState *festate, ForeignScanState *node)
 		foreach (lc, quals)
 		{
 			ExprState *state = lfirst(lc);
-			if (handle_condition(state, &node->ss, festate->datemin_field, festate->op_oids, &timestamp))
+			if (festate->datemin_field && handle_condition(state, &node->ss, festate->datemin_field, festate->op_oids, &timestamp))
 				festate->datemin_timestamp = timestamp;
-			if (handle_condition(state, &node->ss, festate->datemax_field, festate->op_oids, &timestamp))
+			if (festate->datemax_field && handle_condition(state, &node->ss, festate->datemax_field, festate->op_oids, &timestamp))
 				festate->datemax_timestamp = timestamp;
 		}
 	}

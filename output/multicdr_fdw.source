@@ -15,8 +15,8 @@ SET ROLE file_fdw_superuser;
 CREATE SERVER file_server FOREIGN DATA WRAPPER multicdr_fdw;
 -- privilege tests
 SET ROLE file_fdw_user;
-CREATE FOREIGN DATA WRAPPER file_fdw2 HANDLER file_fdw_handler VALIDATOR file_fdw_validator;   -- ERROR
-ERROR:  permission denied to create foreign-data wrapper "file_fdw2"
+CREATE FOREIGN DATA WRAPPER multicdr_fdw2 HANDLER file_fdw_handler VALIDATOR file_fdw_validator;   -- ERROR
+ERROR:  permission denied to create foreign-data wrapper "multicdr_fdw2"
 HINT:  Must be superuser to create a foreign-data wrapper.
 CREATE SERVER file_server2 FOREIGN DATA WRAPPER multicdr_fdw;   -- ERROR
 ERROR:  permission denied for foreign-data wrapper multicdr_fdw
