@@ -131,7 +131,7 @@ typedef struct MultiCdrExecutionState
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
 /* log level, usually DEBUG5 (silent) or NOTICE (messages are sent to client side) */
-#define MULTICDR_FDW_TRACE_LEVEL NOTICE
+#define MULTICDR_FDW_TRACE_LEVEL DEBUG5
 
 /*
  * SQL functions

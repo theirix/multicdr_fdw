@@ -34,5 +34,6 @@ OPTIONS (
 	filefield 'filename'
 );
 
--- select filename from multicdr_test_table where	datemin = cast('2009-12-01 01:23:45' as timestamp) and
---		datemax = cast('2012-12-01 01:23:45' as timestamp);
+-- select filename from multicdr_test_table where	
+--   datemin = cast('2009-12-01 01:23:45' as timestamp) and
+--   datemax = cast('2012-12-01 01:23:45' as timestamp);
