@@ -24,7 +24,7 @@ CREATE FOREIGN TABLE multicdr_test_table (
 		datemax TIMESTAMP
 ) SERVER multicdr_fdw_server
 OPTIONS (
-	directory '/projects/concerteza/sqlmed/multicdr_fdw/data/regression3', 
+	directory '/projects/concerteza/postgres/multicdr_fdw/data/regression3', 
 	pattern 'MSC_(.*)-([[:digit:]]+)\.cdr$',
 	dateformat '$1=YYYYMMDDHHMISS',
 	posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329',

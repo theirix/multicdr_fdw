@@ -4,7 +4,6 @@ EXTENSION = multicdr_fdw
 DATA = multicdr_fdw--1.1.sql
 
 REGRESS = multicdr_fdw
-REGRESS_OPTS = --user postgres
 
 EXTRA_CLEAN = sql/multicdr_fdw.sql expected/multicdr_fdw.out
 
