@@ -82,7 +82,7 @@ CREATE FOREIGN TABLE tbl_alpha (
   f4 int4,
   f5 text
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329');
+OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', rowminlen '339', rowmaxlen '340');
 CREATE FOREIGN TABLE tbl_beta (
   f1 text,
   f2 int4,
@@ -90,13 +90,13 @@ CREATE FOREIGN TABLE tbl_beta (
   f4 int4,
   f5 text
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329');
+OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', rowminlen '339', rowmaxlen '340');
 GRANT SELECT ON tbl_beta TO file_fdw_user;
 CREATE FOREIGN TABLE tbl_bad (
   f1 text,
   f2 text
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression9000', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329');
+OPTIONS (directory '@abs_srcdir@/data/regression9000', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', rowminlen '339', rowmaxlen '340');
 
 -- basic query tests
 SELECT * FROM tbl_alpha ORDER BY f4;
@@ -107,7 +107,7 @@ SELECT * FROM tbl_alpha c JOIN tbl_beta t ON (t.f2 = c.f2) WHERE c.f4 < 100 AND 
 \t on
 SELECT SUM(f4) FROM tbl_alpha;      -- 1572121
 SELECT count(*) FROM tbl_alpha;     -- 19
-SELECT count(*) FROM tbl_beta;      -- 58960
+SELECT count(*) FROM tbl_beta;      -- 490
 \t off
 
 -- error context report tests
@@ -137,7 +137,9 @@ OPTIONS (directory '@abs_srcdir@/data/regression3',
 	mapfields '0,1, 0,0,0',
 	dateminfield 'datemin',
 	datemaxfield 'datemax',
-	filefield 'filename'
+	filefield 'filename',
+	rowminlen '339', 
+	rowmaxlen '340'
 );
 \t on
 SELECT filename, COUNT(filename) FROM tbl_date GROUP BY filename ORDER BY filename;
@@ -213,7 +215,7 @@ CREATE FOREIGN TABLE tbl_gamma (
   f4 int4,
   filename text
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,2,1,0', filefield 'filename');
+OPTIONS (directory '@abs_srcdir@/data/regression1', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,2,1,0', filefield 'filename', rowminlen '339', rowmaxlen '340');
 
 \t on
 SELECT distinct filename FROM tbl_gamma;
@@ -228,10 +230,25 @@ CREATE FOREIGN TABLE tbl_gamma (
   f3 text,
   f4 int4
 ) SERVER file_server
-OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,-1,1,0', filefield 'filename');
+OPTIONS (directory '@abs_srcdir@/data/regression2', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,-1,1,0', filefield 'filename', rowminlen '339', rowmaxlen '340');
 
 \t on
 SELECT count(DISTINCT Filename) FROM tbl_gamma; -- 4
+\t off
+
+-- empty fields test
+CREATE FOREIGN TABLE tbl_emptyspaces (
+  f1 text,
+  f2 int4,
+  f3 text,
+  f4 int4,
+  f5 text
+) SERVER file_server
+OPTIONS (directory '@abs_srcdir@/data/regression4', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,2,1,0');
+
+\t on
+SELECT count(*) FROM tbl_emptyspaces; -- 19
+SELECT count(*) FROM tbl_emptyspaces WHERE f1 is NULL; -- 2
 \t off
 
 -- cleanup

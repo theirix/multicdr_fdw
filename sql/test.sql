@@ -29,6 +29,8 @@ OPTIONS (
 	dateformat '$1=YYYYMMDDHHMISS',
 	posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329',
 	mapfields '0,1,2,3,4,5,6,7,8,9, 0,0,0',
+	rowminlen 340,
+	rowmaxlen 341,
 	dateminfield 'datemin',
 	datemaxfield 'datemax',
 	filefield 'filename'

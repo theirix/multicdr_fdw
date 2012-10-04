@@ -60,6 +60,10 @@ Default mapping is a one-to-one.
 Specified positions in chars where each CDR field is started. Fields are
 always left-aligned so a position should point to the non-space.
 
+* rowminlen, rowmaxlen. Integers (specified as text), optional.
+Minimum and maximum lengths of valid CDR row.
+Row must satisfy to specified length restriction to be fetched into database.
+
 Building and installing from source
 --------------------------------------------------
 

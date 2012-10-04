@@ -67,6 +67,8 @@ static struct MultiCdrFdwOption valid_options[] = {
 	{"posfields", ForeignTableRelationId},
 	{"mapfields", ForeignTableRelationId},
 	{"filefield", ForeignTableRelationId},
+	{"rowminlen", ForeignTableRelationId},
+	{"rowmaxlen", ForeignTableRelationId},
 	{"dateminfield", ForeignTableRelationId},
 	{"datemaxfield", ForeignTableRelationId},
 
@@ -87,6 +89,8 @@ typedef struct MultiCdrExecutionState
 	char			*file_field;					/* name of field to write a filename */
 	char			*datemin_field;				/* name of field to write a min date */
 	char			*datemax_field;				/* name of field to write a max date */
+	int				rowminlen;						/* minimum length of valid cdr row */
+	int				rowmaxlen;						/* maximum length of valid cdr row */
 
 	/* computed parameters */
 	Timestamp	datemin_timestamp;		/* timestamp with min date */
@@ -131,7 +135,7 @@ typedef struct MultiCdrExecutionState
 #define MULTICDR_FDW_FILEBUF_SIZE 512
 
 /* log level, usually DEBUG5 (silent) or NOTICE (messages are sent to client side) */
-#define MULTICDR_FDW_TRACE_LEVEL DEBUG5
+#define MULTICDR_FDW_TRACE_LEVEL NOTICE
 
 /*
  * SQL functions
@@ -390,6 +394,7 @@ parseOptions(Oid catalog, List *options, MultiCdrExecutionState *state)
 	char *date_format_str = NULL;
 	char *map_fields_str = NULL;
 	char *pos_fields_str = NULL;
+	char *rowminlen = NULL, *rowmaxlen = NULL;
 	pg_wchar* wdate_format_str;
 	regex_t date_format_regex;
 	regmatch_t groups[3];
@@ -456,6 +461,16 @@ parseOptions(Oid catalog, List *options, MultiCdrExecutionState *state)
 		{
 			defGetStringOrNullPrecheck(def, &state->file_field);
 		}
+		else if (strcmp(def->defname, "rowminlen") == 0)
+		{
+			defGetStringOrNullPrecheck(def, &rowminlen);
+			state->rowminlen = rowminlen ? safe_strtol(rowminlen) : 0;
+		}
+		else if (strcmp(def->defname, "rowmaxlen") == 0)
+		{
+			defGetStringOrNullPrecheck(def, &rowmaxlen);
+			state->rowmaxlen = rowmaxlen ? safe_strtol(rowmaxlen) : 0;
+		}
 		else if (strcmp(def->defname, "dateminfield") == 0)
 		{
 			defGetStringOrNullPrecheck(def, &state->datemin_field);
@@ -515,6 +530,12 @@ parseOptions(Oid catalog, List *options, MultiCdrExecutionState *state)
 		{
 			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("dateformat and dateminfield/datemaxfield must be specified simultaneously")));
 		}
+
+		if (state->rowminlen > 0 && state->rowmaxlen > 0 && state->rowminlen > state->rowmaxlen)
+		{
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("rowminlen is greater than rowmaxlen")));
+		}
+
 	}
 }
 
@@ -730,6 +751,7 @@ fetch_valid_operators_oid(List** oids)
 	Oid oid;
 	MemoryContext	mctxt = CurrentMemoryContext, spimctxt;
 
+	/* TODO make use of typcache.h */
 	*oids = NIL;
 
 	res	= SPI_connect();
@@ -1379,13 +1401,23 @@ parseLine(MultiCdrExecutionState *festate)
 {
 	int cur_column;
 	char *start, *end;
-	char *string_end;
+	size_t string_len;
 
-	string_end = festate->read_buf + strlen(festate->read_buf);
+	string_len = strlen(festate->read_buf);
 
-	if (festate->read_buf + festate->pos_fields[festate->pos_fields_count-1] >= string_end)
+	/* first of all check for a very large string */
+	if (festate->pos_fields[festate->pos_fields_count-1] >= string_len)
 	{
-		elog(MULTICDR_FDW_TRACE_LEVEL, "skipping special row %d", festate->cdr_row);
+		elog(MULTICDR_FDW_TRACE_LEVEL, "skipping special row %d because it does not fit into fields",
+				festate->cdr_row);
+		return false;
+	}
+	/* check for length restrictions */
+	if ((festate->rowminlen > 0 && string_len < festate->rowminlen) ||
+			(festate->rowmaxlen > 0 && string_len > festate->rowmaxlen))
+	{
+		elog(MULTICDR_FDW_TRACE_LEVEL, "skipping row %d with length %ld (must be [%d;%d])",
+				festate->cdr_row, string_len, festate->rowminlen, festate->rowmaxlen);
 		return false;
 	}
 
@@ -1393,23 +1425,13 @@ parseLine(MultiCdrExecutionState *festate)
 	{
 		start = festate->pos_fields[cur_column] + festate->read_buf;
 		if (cur_column == festate->cdr_columns_count - 1)
-			end = string_end;
+			end = string_len + festate->read_buf;
 		else
 			end = festate->pos_fields[cur_column+1] + festate->read_buf;
 
-		/* don't skip spaces at beginning, it's a sign of a bad CDR line
-			* for (; start != end && *start == ' '; ++start)
-			;*/
+		/* squeeze spaces */
 		for (; start != end && *(end-1) == ' '; --end)
 			;
-
-		if (start == end || *start == ' ')
-		{
-			ereport(MULTICDR_FDW_TRACE_LEVEL,
-					(errcode(ERRCODE_NO_DATA_FOUND),
-						errmsg("skipping CDR row %d with empty field %d", festate->cdr_row, cur_column)));
-			return false;
-		}
 
 		festate->fields_start[cur_column] = start;
 		festate->fields_end[cur_column] = end;
@@ -1474,7 +1496,8 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 
 			/*elog(MULTICDR_FDW_TRACE_LEVEL, "mapped column %d to field %d, %x:%x (%d)", column, cdr_field_mapped, start, end, end-start);*/
 
-			/* check is a precaution, should never happens because if it's a good line there cannot be empty columns */
+			/* check is a precaution, should never happens because if it's a good line there cannot be empty columns
+			 * actually there can be empty column, NULL will be passed */
 			if (start != end)
 			{
 				temp = pnstrdup(start, end-start);
@@ -1494,6 +1517,11 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 						slot->tts_isnull[column] = true;
 				}
 				pfree(temp);
+			}
+			else
+			{
+				slot->tts_values[column] = 0;
+				slot->tts_isnull[column] = true;
 			}
 		}
 	}
@@ -1544,3 +1572,5 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 	*total_cost = *startup_cost * 10;
 	baserel->rows = 1;
 }
+
+/* vim: set noexpandtab tabstop=4 shiftwidth=4: */
