@@ -1,0 +1,16 @@
+Revision history for PostgreSQL extension.
+
+1.2.0 2012-12-31T235959
+      - UNRELEASED
+      - Matched PGXN directory layout.
+      - Allow to have CDRs with empty fields. They are read as NULL values.
+      - Added row length restrictions (rowminlen and rowmaxlen foreign table options) to filter out non-valid rows.
+
+1.1   2012-08-07T001248
+      - Documentation changes.
+      - Date restrictions added
+
+1.0   2012-05-08T030000
+      - Initial version
+      - Extracting CDRs in a specified directory
+      - Fully customizable CDR format specification

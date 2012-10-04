@@ -428,7 +428,7 @@ CREATE FOREIGN TABLE tbl_emptyspaces (
   f4 int4,
   f5 text
 ) SERVER file_server
-OPTIONS (directory '/projects/concerteza/postgres/multicdr_fdw/data/regression4', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,2,1,0');
+OPTIONS (directory '@abs_srcdir@/data/regression4', pattern '.*\.cdr$', posfields '0,6,15,40,50,71,92,113,175,212,217,227,232,319,329', mapfields '4,3,2,1,0');
 \t on
 SELECT count(*) FROM tbl_emptyspaces; -- 19
     19
