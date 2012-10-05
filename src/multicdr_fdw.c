@@ -34,12 +34,16 @@
 #include "nodes/memnodes.h"
 #include "nodes/print.h"
 #include "optimizer/cost.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
 #include "regex/regex.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/formatting.h"
 #include "utils/timestamp.h"
+#include "utils/rel.h"
 
 PG_MODULE_MAGIC;
 
@@ -149,14 +153,21 @@ PG_FUNCTION_INFO_V1(multicdr_fdw_validator);
 /*
  * FDW callback routines
  */
-static FdwPlan *filePlanForeignScan(Oid foreigntableid,
-					PlannerInfo *root,
-					RelOptInfo *baserel);
+
+#if PG_VERSION_NUM >= 90200
+static void fileGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
+static void fileGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid);
+static ForeignScan *fileGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid, ForeignPath *best_path, List *tlist, List *scan_clauses);
+#else
+static FdwPlan *filePlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel);
+#endif
+
 static void fileExplainForeignScan(ForeignScanState *node, ExplainState *es);
 static void fileBeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *fileIterateForeignScan(ForeignScanState *node);
 static void fileReScanForeignScan(ForeignScanState *node);
 static void fileEndForeignScan(ForeignScanState *node);
+
 
 /*
  * Helper functions
@@ -169,9 +180,6 @@ static char* regex_group_str(const char *str, const regmatch_t group);
 static int find_column_by_name (const char *name, TupleDesc tuple_desc);
 static void parseOptions(Oid catalog, List *options, MultiCdrExecutionState *state);
 static void fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state);
-static void estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
-				MultiCdrExecutionState *state,
-				Cost *startup_cost, Cost *total_cost);
 static bool
 fetchFileData(MultiCdrExecutionState *festate);
 static bool
@@ -203,7 +211,16 @@ multicdr_fdw_handler(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
+#if PG_VERSION_NUM >= 90200
+	fdwroutine->AnalyzeForeignTable = NULL;
+
+	fdwroutine->GetForeignRelSize = fileGetForeignRelSize;
+	fdwroutine->GetForeignPaths = fileGetForeignPaths;
+	fdwroutine->GetForeignPlan = fileGetForeignPlan;
+#else
 	fdwroutine->PlanForeignScan = filePlanForeignScan;
+#endif
+
 	fdwroutine->ExplainForeignScan = fileExplainForeignScan;
 	fdwroutine->BeginForeignScan = fileBeginForeignScan;
 	fdwroutine->IterateForeignScan = fileIterateForeignScan;
@@ -569,29 +586,6 @@ fileGetOptions(Oid foreigntableid, MultiCdrExecutionState *state)
 	parseOptions(ForeignTableRelationId, options, state);
 }
 
-/*
- * filePlanForeignScan
- *		Create a FdwPlan for a scan on the foreign table
- */
-static FdwPlan *
-filePlanForeignScan(Oid foreigntableid,
-					PlannerInfo *root,
-					RelOptInfo *baserel)
-{
-	FdwPlan *fdwplan;
-	MultiCdrExecutionState state;
-
-	/* Fetch options */
-	fileGetOptions(foreigntableid, &state);
-
-	/* Construct FdwPlan with cost estimates */
-	fdwplan = makeNode(FdwPlan);
-	estimate_costs(root, baserel, &state,
-						&fdwplan->startup_cost, &fdwplan->total_cost);
-	fdwplan->fdw_private = NIL; /* not used */
-
-	return fdwplan;
-}
 
 /*
  * fileExplainForeignScan
@@ -1558,19 +1552,109 @@ fileReScanForeignScan(ForeignScanState *node)
 	beginScan( festate, node );
 }
 
+/* 
+ * TODO make actual impl to use actual CDR file information
+ */
+
+#if PG_VERSION_NUM >= 90200
 /*
- * Estimate costs of scanning a foreign table.
- * Actually we cannot provide any estimation because estimation itself
- * is very resourse-hungry
+ * PostgreSQL 9.2 plan functions are derived from file_fdw 
+ */
+
+/* 
+ * Obtain relation size estimates for a foreign table 
  */
 static void
-estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
-		MultiCdrExecutionState *state,
-		Cost *startup_cost, Cost *total_cost)
+fileGetForeignRelSize(PlannerInfo *root,
+					  RelOptInfo *baserel,
+					  Oid foreigntableid)
 {
-	*startup_cost = baserel->baserestrictcost.startup;
-	*total_cost = *startup_cost * 10;
-	baserel->rows = 1;
+	MultiCdrExecutionState *state;
+
+	state = (MultiCdrExecutionState *) palloc(sizeof(MultiCdrExecutionState));
+	/* Fetch options at the first time.
+	 * It's a beginning of the planning. */
+	fileGetOptions(foreigntableid, state);
+
+	/* TODO do we need to save state here? */
+	baserel->fdw_private = NIL;
+
+	/* Estimate relation size */
+	baserel->rows = 100;
 }
+
+/*
+ * Create possible access paths for a scan on the foreign table
+ */
+static void
+fileGetForeignPaths(PlannerInfo *root,
+					RelOptInfo *baserel,
+					Oid foreigntableid)
+{
+	/* because state is not saved to fdw_private
+	 * MultiCdrExecutionState *state = (MultiCdrExecutionState*) baserel->fdw_private;*/
+	Cost		startup_cost;
+	Cost		total_cost;
+
+	/* Estimate costs */
+	startup_cost = baserel->baserestrictcost.startup;
+	total_cost = startup_cost * 10;
+
+	/* Create a ForeignPath node and add it as only possible path */
+	add_path(baserel, (Path*)create_foreignscan_path(root, baserel,
+									 baserel->rows,
+									 startup_cost,
+									 total_cost,
+									 NIL,		/* no pathkeys */
+									 NULL,		/* no outer rel either */
+									 NIL));		/* no fdw_private data */
+}
+
+/*
+ * Create a ForeignScan plan node for scanning the foreign table
+ */
+static ForeignScan *
+fileGetForeignPlan(PlannerInfo *root,
+				   RelOptInfo *baserel,
+				   Oid foreigntableid,
+				   ForeignPath *best_path,
+				   List *tlist,
+				   List *scan_clauses)
+{
+	Index scan_relid = baserel->relid;
+
+	scan_clauses = extract_actual_clauses(scan_clauses, false);
+
+	/* Create the ForeignScan node */
+	return make_foreignscan(tlist, scan_clauses, scan_relid, NIL, NIL);
+}
+
+#else
+/* PostgreSQL 9.1 */
+
+/*
+ * filePlanForeignScan
+ *		Create a FdwPlan for a scan on the foreign table
+ */
+static FdwPlan *
+filePlanForeignScan(Oid foreigntableid,
+					PlannerInfo *root,
+					RelOptInfo *baserel)
+{
+	FdwPlan *fdwplan;
+	MultiCdrExecutionState state;
+
+	/* Fetch options */
+	fileGetOptions(foreigntableid, &state);
+
+	/* Construct FdwPlan with cost estimates */
+	fdwplan = makeNode(FdwPlan);
+	fdwplan->startup_cost = baserel->baserestrictcost.startup;
+	fdwplan->total_cost = fdwplan->startup_cost * 10;
+	fdwplan->fdw_private = NIL; /* not used */
+
+	return fdwplan;
+}
+#endif
 
 /* vim: set noexpandtab tabstop=4 shiftwidth=4: */
