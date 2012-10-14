@@ -13,11 +13,6 @@ PG_CONFIG    := pg_config
 #PG_CPPFLAGS  = 
 EXTRA_CLEAN = sql/$(EXTENSION)--$(EXTVERSION).sql $(TESTSCLEAN)
 
-foo: 
-	echo $(TESTS)
-	echo $(TESTSPARSED)
-	echo $(REGRESS)
-
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 
 sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql
