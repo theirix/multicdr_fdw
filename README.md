@@ -1,144 +1,101 @@
 MultiCDR FDW
 ===================
 
-Foreign Data Wrapper for dealing with multiple CDR files.
-CDR files from a directory can be read into a table with a 
+Foreign Data Wrapper for representing CDR files stream as an external SQL table. CDR files from a directory can be read into a table with a 
 specified field-to-column mapping.
 
-Works with PostgreSQL 9.1.
+Works with PostgreSQL 9.1 and 9.2.
 
 Usage
 -----
 
-Please refer to a PostgreSQL Foreign Data Wrapper documentation.
-In a few words extension, foreign data server and foreign table
-must be created with a superuser permission. Then a user with 
-appropriate permissions can select CDR data from a table.
+Please consult with doc/multicdr_fdw.md for a function and operator reference.
 
-CDR file consists of multiple rows. Each row contains data fields at
-fixed positions. List of positions is specified when table is created.
-Some special rows are ignored if they contains not enough columns.
-
-Now only integer (int4) and text column types are allowed. 
-Please check fields for overflow.
-
-CDR search can be controlled with date restrictons.
-Minimum and maximum dates can be specified in a query so extension
-could early skip a file if it does not match predefined date pattern.
-
-Options
--------
-
-### directory
-Text, mandatory.
-A directory where FDW should look for files. Scan is not recursive.
-
-### pattern
-Text, mandatory.
-Posix Extended regex for selecting a file path.
-If dateformat is used, specify a date portion as a regex group.
-
-### dateformat
-Text, optional.
-Specifies how date is stored in a filename. Uses a following format:
-$filename_pattern_group_no=date_regex
-Pattern must have a 'filename_pattern_group_no' group which contains a date
-portion which must be parsed with a 'date_regex' regex.
-
-### dateminfield, datemaxfield
-Timestamp, optional.
-Must be specified if a dateformat is specified.
-Contains column names with a minimum or maximum date restriction.
-For using date restrictions one should provide values for these fields
-using a WHERE clause. Only '=' operator for timestamps is recognized.
-
-### filefield
-Text, optional.
-Name of the column that should contain a row's file path.
-
-### mapfields
-Text array with a comma-separated integers, optional.
-Specifies a mapping from table columns to a CDR fields. For example, "4,5,6"
-says that fourth, fifth and sixth fields from each CDR row will be read to a
-table. An array and a table must have equal dimensions.
-Fields are mapped sequentially if mapfields is not specified.
-Default mapping is a one-to-one.
-
-### posfields
-Text array with a comma-separated integers, mandatory.
-Specified positions in chars where each CDR field is started. Fields are
-always left-aligned so a position should point to the non-space.
-
-### rowminlen, rowmaxlen
-Integers (specified as text), optional.
-Minimum and maximum lengths of valid CDR row.
-Row must satisfy to specified length restriction to be fetched into database.
+On PGXN please click on extension from _Extensions_ section to view reference.
 
 Installing extension
 --------------------
 
-### Building and installing from source
+To use an extension one must be built, installed into PostgreSQL directory
+and registered in a database.
 
-Assume you are a current postgres user.
+### Building extension
 
-1. Build an extension
+#### Method 1: Using PGXN network
 
-        gmake PG_CONFIG=$POSTGRES_DIR/bin/pg_config clean all install
+The easisest method to get and install an extension from PGXN network.
+PGXN client downloads and builds the extension.
 
-2. Restart a server
-3. Create extension, foreign server and table 
-4. Optionally, run tests
+    pgxn --pg_config <postgresql_install_dir>/bin/pg_config install multicdr_fdw
 
-        gmake PG_CONFIG=$POSTGRES_DIR/bin/pg_config PGUSER=postgres installcheck
+PGXN client itself is available at [github](https://github.com/dvarrazzo/pgxnclient) and
+can be installed with your favourite method, i.e. `easy_install pgxnclient`.
 
-### Installing from prebuilt version
+#### Method 2: Using PGXS makefiles
 
-It is the easiest automatic way.
+C extension are best built and installed using [PGXS](http://www.postgresql.org/docs/9.1/static/extend-pgxs.html).
+PGXS ensures that make is performed with needed compiler and flags. You only need GNU make and a compiler to build
+an extension on an almost any UNIX platform (Linux, Solaris, OS X).
 
-1. Invoke a command in a distributon directory:
+Compilation:
 
-        gmake PG_CONFIG=$POSTGRES_DIR/bin/pg_config install
+    gmake PG_CONFIG=<postgresql_install_dir>/bin/pg_config
 
-2. Restart a server
-3. Create extension, foreign server and table
+Installation (as superuser):
 
-### Installing from prebuilt version
+    gmake PG_CONFIG=<postgresql_install_dir>/bin/pg_config install
 
-Manual way.
+PostgreSQL server must be restarted. 
 
-1. Copy `multicdr_fdw.so` to the pkglibdir dir. Consult with `$POSTGRES_DIR/bin/pg_config --pkglibdir` 
-2. Copy `multicdr_fdw.control` and `multicdr_fdw--<version>.sql` to extension dir. Consult with `$POSTGRES_DIR/bin/pg_config --sharedir`/extension
-3. Restart a server
-4. Create extension, foreign server and table
+To uninstall extension completely you may use this command (as superuser):
+
+    gmake PG_CONFIG=<postgresql_install_dir>/bin/pg_config uninstall
+
+Project contains SQL tests that can be launched on PostgreSQL with installed extension.
+Tests are performed on a dynamically created database with a specified user (with the 
+appropriated permissions - create database, for example):
+
+    gmake PG_CONFIG=<postgresql_install_dir>/bin/pg_config PGUSER=postgres installcheck
+
+#### Method 3: Manually
+
+Use this method if you have a precompiled extension and do not want to install this with help of PGXS.
+Or maybe you just do not have GNU make on a production server.
+
+Copy library to the PostgreSQL library directory:
+
+    cp multicdr_fdw.so `<postgresql_install_dir>/bin/pg_config --pkglibdir` 
+
+Copy control file to the extension directory:
+    
+    cp multicdr_fdw.control `<postgresql_install_dir>/bin/pg_config --sharedir`/extension
+
+Copy SQL prototypes file to the extension directory:
+    
+    cp multicdr_fdw--<version>.sql `<postgresql_install_dir>/bin/pg_config --sharedir`/extension
+
+To uninstall extension just remove files you copied before.
 
 ### Platform notes
 
 Please note that path to the pg_config could be $POSTGRES_DIR/bin/64/pg_config for 64-bit solaris systems.
 
 
-Example initialization sql script
----------------------------------
+### Creating extension in a database
 
-        -- Should be run by a superuser
+Extension must be previously installed to a PostgreSQL directory.
 
-        CREATE EXTENSION multicdr_fdw;
+Extension is created in a particular database (as superuser):
 
-        DROP FOREIGN TABLE IF EXISTS multicdr_test_table;
-        DROP SERVER IF EXISTS multicdr_fdw_server;
+    create extension multicdr_fdw;
 
-        CREATE SERVER multicdr_fdw_server FOREIGN DATA WRAPPER multicdr_fdw;
+It creates all the functions, operators and other stuff from extension.
+Note that you must restart a server if a previous library was already installed
+at the same place. In other words, always restart to be sure. 
 
-        CREATE FOREIGN TABLE multicdr_test_table (
-            field1 text,
-            field2 text,
-            field3 text,
-            field4 text,
-            field5 text
-        ) SERVER multicdr_fdw_server OPTIONS (
-            directory '/opt/pool',
-            pattern '.*\.cdr',
-            posfields '0,6,15,40,50,71,92');
+To drop an extension use:
 
+    drop extension multicdr_fdw cascade;
 
 Version history
 ---------------
