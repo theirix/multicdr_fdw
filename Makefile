@@ -1,9 +1,9 @@
 EXTENSION    = multicdr_fdw
-EXTVERSION   = 1.2.0
+EXTVERSION   = 1.2.1
 MODULE_big   = multicdr_fdw
 OBJS         = $(patsubst %.c,%.o,$(wildcard src/*.c))
 DATA         = $(wildcard sql/*--*.sql) sql/$(EXTENSION)--$(EXTVERSION).sql
-#DOCS         = $(wildcard doc/*.md)
+DOCS         = $(wildcard doc/*.md)
 TESTS        = $(wildcard test/input/*.source)
 TESTSCLEAN   = $(patsubst test/input/%.source,test/sql/%.sql,$(TESTS)) \
 							 $(patsubst test/input/%.source,expected/%.out,$(TESTS))

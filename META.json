@@ -1,0 +1,51 @@
+{
+  "name": "multicdr_fdw",
+  "abstract": "MultiCDR FDW",
+  "description": "Foreign Data Wrapper for representing CDR files stream as an external SQL table.",
+  "version": "1.2.1",
+  "maintainer": [
+    "Eugene Seliverstov <theirix@gmail.com>"
+  ],
+  "license": "postgresql",
+  "provides": {
+    "multicdr_fdw": {
+      "file": "sql/multicdr_fdw.sql",
+      "docfile": "doc/multicdr_fdw.md",
+      "version": "1.2.1"
+    }
+  },
+  "prereqs": {
+    "runtime": {
+      "requires": {
+        "PostgreSQL": "9.1.0"
+      }
+    },
+    "test": {
+      "requires": {
+        "plpgsql": 0
+      }
+    }
+  },
+  "resources": {
+    "bugtracker": {
+      "web": "http://github.com/theirix/multicdr_fdw/issues/"
+    },
+    "repository": {
+      "url": "git://github.com/theirix/multicdr_fdw.git",
+      "web": "http://github.com/theirix/multicdr_fdw/",
+      "type": "git"
+    }
+  },
+  "generated_by": "Eugene Seliverstov",
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "http://pgxn.org/meta/spec.txt"
+  },
+  "tags": [
+    "fdw",
+		"foreign data wrapper",
+    "sql med",
+		"external data",
+		"cdr"
+  ]
+}
