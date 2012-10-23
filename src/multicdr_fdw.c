@@ -615,7 +615,7 @@ enumerateFiles (MultiCdrExecutionState *festate)
 	bool should_pass = false;
 	regmatch_t groups[16];
 	char *file_date_str;
-	Timestamp file_timestamp;
+	Timestamp file_timestamp = (Timestamp)0;
 
 	festate->files = NIL;
 	festate->current_file = NULL;
