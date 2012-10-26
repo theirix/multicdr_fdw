@@ -2,7 +2,7 @@
   "name": "multicdr_fdw",
   "abstract": "MultiCDR FDW",
   "description": "Foreign Data Wrapper for representing CDR files stream as an external SQL table.",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "maintainer": [
     "Eugene Seliverstov <theirix@gmail.com>"
   ],
@@ -11,7 +11,7 @@
     "multicdr_fdw": {
       "file": "sql/multicdr_fdw.sql",
       "docfile": "doc/multicdr_fdw.md",
-      "version": "1.2.1"
+      "version": "1.2.2"
     }
   },
   "prereqs": {

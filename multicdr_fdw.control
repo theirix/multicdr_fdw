@@ -1,5 +1,5 @@
 # multicdr_fdw extension
 comment = 'FDW wrapper for CDR multiple file access'
-default_version = '1.2.1'
+default_version = '1.2.2'
 module_pathname = '$libdir/multicdr_fdw'
 relocatable = true

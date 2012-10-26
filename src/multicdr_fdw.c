@@ -144,8 +144,8 @@ typedef struct MultiCdrExecutionState
 /*
  * SQL functions
  */
-extern Datum multicdr_fdw_handler(PG_FUNCTION_ARGS);
-extern Datum multicdr_fdw_validator(PG_FUNCTION_ARGS);
+PGDLLEXPORT extern Datum multicdr_fdw_handler(PG_FUNCTION_ARGS);
+PGDLLEXPORT extern Datum multicdr_fdw_validator(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(multicdr_fdw_handler);
 PG_FUNCTION_INFO_V1(multicdr_fdw_validator);
@@ -350,22 +350,22 @@ defGetStringOrNullPrecheck(DefElem* def, char **field)
 static Timestamp
 parseTimestamp(const char *str, const char *fmt)
 {
-  Datum timestamptz;
+	Datum timestamptz;
 	Datum ts;
-  timestamptz = DirectFunctionCall2(to_timestamp,
-      PointerGetDatum(cstring_to_text(str)),
-      PointerGetDatum(cstring_to_text(fmt)));
-  Assert(timestamptz);
-  ts = DirectFunctionCall1(timestamptz_timestamp,
-      timestamptz);
-  return DatumGetTimestamp(ts);
+	timestamptz = DirectFunctionCall2(to_timestamp,
+			PointerGetDatum(cstring_to_text(str)),
+			PointerGetDatum(cstring_to_text(fmt)));
+	Assert(timestamptz);
+	ts = DirectFunctionCall1(timestamptz_timestamp,
+			timestamptz);
+	return DatumGetTimestamp(ts);
 }
 
 static const char*
 timestamp_to_str(Timestamp timestamp)
 {
-  TimestampTz timestamptz = DatumGetTimestampTz(DirectFunctionCall1(timestamp_timestamptz, timestamp));
-  return timestamptz_to_str(timestamptz);
+	TimestampTz timestamptz = DatumGetTimestampTz(DirectFunctionCall1(timestamp_timestamptz, TimestampGetDatum(timestamp)));
+	return timestamptz_to_str(timestamptz);
 }
 
 
@@ -696,7 +696,8 @@ enumerateFiles (MultiCdrExecutionState *festate)
 			}
 			PG_END_TRY();
 
-			elog(MULTICDR_FDW_TRACE_LEVEL, "timestamp of a file \"%s\" is %s", path, timestamp_to_str(file_timestamp));
+			if (file_timestamp)
+				elog(MULTICDR_FDW_TRACE_LEVEL, "timestamp of a file \"%s\" is %s", path, timestamp_to_str(file_timestamp));
 		}
 
 		/* check datemin */
@@ -740,7 +741,7 @@ static void
 fetch_valid_operators_oid(List** oids)
 {
 	int res;
-	int i;
+	unsigned int i;
 	bool isnull;
 	Oid oid;
 	MemoryContext	mctxt = CurrentMemoryContext, spimctxt;
@@ -781,7 +782,7 @@ extract_date_expression(Node *node, TupleDesc tupdesc, const char* field_name, L
 {
 	OpExpr *op = (OpExpr *) node;
 	Node *left, *right, *tmp;
-	Index varattno;
+	AttrNumber varattno;
 	char *key;
 	char *s;
 
@@ -1041,7 +1042,7 @@ moveToNextFile(MultiCdrExecutionState *festate)
 	}
 
 	/* open a file */
-	festate->source = open( lfirst(festate->current_file), O_RDONLY);
+	festate->source = open( lfirst(festate->current_file), O_RDONLY, 0 );
 	if (festate->source == -1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1270,12 +1271,13 @@ fetchLineFromFile(MultiCdrExecutionState *festate)
 	{
 		eol_pos = findEol( festate->file_buf_start, festate->file_buf_end );
 		end_pos = eol_pos ? eol_pos : festate->file_buf_end;
-		copy_amount = end_pos - festate->file_buf_start;
+		/* TODO make all variables size_t's */
+		copy_amount = (int)(end_pos - festate->file_buf_start);
 
 		/* realloc if needed */
 		if (bytes_read + copy_amount >= festate->read_buf_size)
 		{
-			festate->read_buf_size = (bytes_read + copy_amount) * 1.4;
+			festate->read_buf_size = (int)((bytes_read + copy_amount) * 1.4);
 			elog(MULTICDR_FDW_TRACE_LEVEL, "file reader: realloc buffer to %d", festate->read_buf_size);
 			festate->read_buf = repalloc( festate->read_buf, festate->read_buf_size );
 		}
@@ -1365,7 +1367,7 @@ parseIntArray(char *string, int **vals)
 						errmsg("cannot parse array")));
 		start = end + 1;
 		if (count >= initial_count)
-			*vals = repalloc(*vals, count * 1.4 * sizeof(int));
+			*vals = repalloc(*vals, (size_t)(count * 1.4 * sizeof(int)));
 	}
 	
 	return count+1;
@@ -1503,7 +1505,7 @@ makeTuple(MultiCdrExecutionState *festate, TupleTableSlot *slot)
 						break;
 
 					case TEXTOID:
-						conv = pg_any_to_server(temp, end-start, PG_LATIN1);
+						conv = pg_any_to_server(temp, (int)(end-start), PG_LATIN1);
 						slot->tts_values[column] = CStringGetTextDatum(conv);
 						break;
 

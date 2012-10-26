@@ -1,6 +1,6 @@
 EXTENSION    = multicdr_fdw
-EXTVERSION   = 1.2.1
-MODULE_big   = multicdr_fdw
+EXTVERSION   = 1.2.2
+MODULE_big   = $(EXTENSION)
 OBJS         = $(patsubst %.c,%.o,$(wildcard src/*.c))
 DATA         = $(wildcard sql/*--*.sql) sql/$(EXTENSION)--$(EXTVERSION).sql
 DOCS         = $(wildcard doc/*.md)

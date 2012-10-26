@@ -1,5 +1,10 @@
 Revision history for PostgreSQL extension.
 
+1.2.2 2012-10-17T003512
+      - Allowed to build on Windows
+      - Fixed a bug on platforms where Timestamp is passed by reference
+      - Fixed test
+
 1.2.1 2012-10-17T003512
       - PostgreSQL 9.2 support
 
